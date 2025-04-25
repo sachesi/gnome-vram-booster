@@ -1,10 +1,10 @@
 BINARY      := gnome-vram-booster
 BIN_SRC     := daemon/target/release/$(BINARY)
 BIN_DEST    := /usr/local/bin/$(BINARY)
-SERVICE     := daemon/$(BINARY).service
-SERVICE_DIR := /etc/systemd/system
-DBUS_CONF   := daemon/org.gnome.VramBooster.conf
-DBUS_DIR    := /etc/dbus-1/system.d
+SERVICE     := packaging/usr/lib/systemd/system/$(BINARY).service
+SERVICE_DIR := /usr/lib/systemd/system
+DBUS_CONF   := packaging/usr/share/dbus-1/system.d/org.gnome.VramBooster.conf
+DBUS_DIR    := /usr/share/dbus-1/system.d
 EXT_UUID    := vram-booster@local
 EXT_SRC     := extension
 EXT_DEST    := $(HOME)/.local/share/gnome-shell/extensions/$(EXT_UUID)
