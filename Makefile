@@ -29,6 +29,8 @@ install: check-deps build
 	sudo systemctl enable --now $(BINARY).service
 	sudo mkdir -p $(EXT_DEST)
 	sudo cp -r $(EXT_SRC)/. $(EXT_DEST)/
+	sudo chmod -R a+rX $(EXT_DEST)
+	sudo glib-compile-schemas $(EXT_DEST)/schemas/
 	@echo ""
 	@echo "Installed. Log out and back in, then enable 'GNOME VRAM Booster' in the Extensions app."
 
@@ -43,6 +45,8 @@ uninstall:
 reload: build
 	sudo install -Dm755 $(BIN_SRC) $(BIN_DEST)
 	sudo cp -r $(EXT_SRC)/. $(EXT_DEST)/
+	sudo chmod -R a+rX $(EXT_DEST)
+	sudo glib-compile-schemas $(EXT_DEST)/schemas/
 	sudo systemctl restart $(BINARY).service
 	@echo "Daemon restarted. Log out and back in to reload the extension."
 

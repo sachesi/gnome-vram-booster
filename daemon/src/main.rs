@@ -60,18 +60,18 @@ struct Inner {
 }
 
 impl Inner {
-    async fn handle_focus(&mut self, pid: u32) {
+    async fn handle_focus(&mut self, pid: u32) -> bool {
         let cgroup = match cgroup_path_for_pid(pid) {
             Some(p) => p,
             None => {
                 warn!("Cannot read cgroup for pid={pid}");
-                return;
+                return false;
             }
         };
 
         if !is_app_scope(&cgroup) {
             info!("pid={pid} skip (not app.slice): {}", unit_label(&cgroup));
-            return;
+            return false;
         }
 
         let label = unit_label(&cgroup).to_string();
@@ -98,6 +98,7 @@ impl Inner {
 
         self.prev_cgroup = Some(cgroup);
         self.current_unit = label;
+        true
     }
 }
 
@@ -107,8 +108,8 @@ struct VramBoosterService {
 
 #[interface(name = "org.gnome.VramBooster")]
 impl VramBoosterService {
-    async fn focus_changed(&self, pid: u32) {
-        self.inner.lock().await.handle_focus(pid).await;
+    async fn focus_changed(&self, pid: u32) -> bool {
+        self.inner.lock().await.handle_focus(pid).await
     }
 
     #[zbus(property)]

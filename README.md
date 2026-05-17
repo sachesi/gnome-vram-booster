@@ -17,7 +17,7 @@ GNOME equivalent of KDE's `plasma-foreground-booster`.
 make install
 ```
 
-See [docs/install.md](docs/install.md) for full instructions.
+See [docs/install.md](docs/install.md) for full instructions and [docs/usage.md](docs/usage.md) for usage and troubleshooting.
 
 ## License
 
