@@ -7,7 +7,7 @@ DBUS_CONF   := packaging/usr/share/dbus-1/system.d/org.gnome.VramBooster.conf
 DBUS_DIR    := /usr/share/dbus-1/system.d
 EXT_UUID    := vram-booster@local
 EXT_SRC     := extension
-EXT_DEST    := $(HOME)/.local/share/gnome-shell/extensions/$(EXT_UUID)
+EXT_DEST    := /usr/share/gnome-shell/extensions/$(EXT_UUID)
 
 .PHONY: all build install uninstall reload logs check-deps
 
@@ -27,24 +27,24 @@ install: check-deps build
 	sudo install -Dm644 $(DBUS_CONF) $(DBUS_DIR)/org.gnome.VramBooster.conf
 	sudo systemctl daemon-reload
 	sudo systemctl enable --now $(BINARY).service
-	mkdir -p $(EXT_DEST)
-	cp -r $(EXT_SRC)/. $(EXT_DEST)/
-	gnome-extensions enable $(EXT_UUID) || true
-	@echo "Installed. Reload GNOME Shell (Alt+F2 r) to activate extension."
+	sudo mkdir -p $(EXT_DEST)
+	sudo cp -r $(EXT_SRC)/. $(EXT_DEST)/
+	@echo ""
+	@echo "Installed. Log out and back in, then enable 'GNOME VRAM Booster' in the Extensions app."
 
 uninstall:
 	-sudo systemctl disable --now $(BINARY).service
 	-sudo rm -f $(BIN_DEST) $(SERVICE_DIR)/$(BINARY).service $(DBUS_DIR)/org.gnome.VramBooster.conf
 	-sudo systemctl daemon-reload
-	-gnome-extensions disable $(EXT_UUID) || true
-	-rm -rf $(EXT_DEST)
-	@echo "Uninstalled."
+	-sudo rm -rf $(EXT_DEST)
+	@echo ""
+	@echo "Uninstalled. Log out and back in to deactivate the extension."
 
 reload: build
 	sudo install -Dm755 $(BIN_SRC) $(BIN_DEST)
-	cp -r $(EXT_SRC)/. $(EXT_DEST)/
+	sudo cp -r $(EXT_SRC)/. $(EXT_DEST)/
 	sudo systemctl restart $(BINARY).service
-	@echo "Reloaded daemon. Reload GNOME Shell (Alt+F2 r) to pick up extension changes."
+	@echo "Daemon restarted. Log out and back in to reload the extension."
 
 logs:
-	journalctl -u $(BINARY).service -f --no-pager
+	sudo journalctl -u $(BINARY).service -f --no-pager
