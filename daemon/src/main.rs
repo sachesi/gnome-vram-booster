@@ -74,6 +74,10 @@ impl Inner {
             return false;
         }
 
+        if self.prev_cgroup.as_deref() == Some(cgroup.as_str()) {
+            return true;
+        }
+
         let label = unit_label(&cgroup).to_string();
         info!("focus pid={pid} → {label}");
 

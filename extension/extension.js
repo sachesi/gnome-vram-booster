@@ -74,6 +74,7 @@ export default class VramBoosterExtension extends Extension {
     enable() {
         this._shellPid = this._readSelfPid();
         this._debounceId = null;
+        this._lastPid = 0;
         this._proxy = null;
         this._daemonWatchId = 0;
         this._indicator = null;
@@ -127,6 +128,7 @@ export default class VramBoosterExtension extends Extension {
         this._proxy = null;
         this._settings = null;
         this._currentApp = null;
+        this._lastPid = 0;
     }
 
     _onDaemonAppeared() {
@@ -155,6 +157,9 @@ export default class VramBoosterExtension extends Extension {
         if (!pid || pid <= 0 || pid === this._shellPid)
             return;
 
+        if (pid === this._lastPid)
+            return;
+
         const wmClass = (win.get_wm_class() ?? '').toLowerCase();
         if (PORTAL_WM_CLASSES.has(wmClass))
             return;
@@ -168,6 +173,7 @@ export default class VramBoosterExtension extends Extension {
 
         this._debounceId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, DEBOUNCE_MS, () => {
             this._debounceId = null;
+            this._lastPid = pid;
             if (this._proxy) {
                 try {
                     this._proxy.FocusChangedRemote(pid, (result, error) => {
