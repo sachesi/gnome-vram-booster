@@ -19,10 +19,11 @@ This daemon propagates the dmem controller into user session cgroups. Without it
 Install from your distribution's repository or build from source:
 https://pixelcluster.github.io/VRAM-Mgmt-fixed/
 
-Enable and start:
+Enable and start both the system service (propagates dmem into user session cgroups) and the user service (propagates dmem into app scopes):
 
 ```
 sudo systemctl enable --now dmemcg-booster.service
+systemctl --user enable --now dmemcg-booster.service
 ```
 
 **3. Rust toolchain**
