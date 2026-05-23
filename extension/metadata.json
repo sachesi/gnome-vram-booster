@@ -3,7 +3,7 @@
   "description": "Dynamic VRAM prioritization for foreground apps via dmem cgroups",
   "uuid": "vram-booster@local",
   "shell-version": ["45", "46", "47", "48", "49", "50"],
-  "version": 2,
+  "version": 3,
   "url": "https://github.com/sachesi/gnome-vram-booster",
   "settings-schema": "org.gnome.shell.extensions.vram-booster"
 }
