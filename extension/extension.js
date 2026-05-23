@@ -51,18 +51,36 @@ export default class VramBoosterExtension extends Extension {
         const show = this._settings.get_boolean('debug-show-active');
         if (show && !this._indicator) {
             this._indicator = new PanelMenu.Button(0.0, 'VRAM Booster', true);
-            this._indicatorLabel = new St.Label({
-                text: 'VRAM: idle',
-                y_align: Clutter.ActorAlign.CENTER,
-                style: 'margin: 0 4px;',
+
+            this._indicatorBox = new St.BoxLayout({
+                vertical: false,
+                style_class: 'panel-status-indicators-box',
             });
-            this._indicator.add_child(this._indicatorLabel);
+
+            this._indicatorIcon = new St.Icon({
+                icon_name: 'video-display-symbolic',
+                style_class: 'system-status-icon',
+                y_align: Clutter.ActorAlign.CENTER,
+            });
+
+            this._indicatorLabel = new St.Label({
+                text: 'idle',
+                y_align: Clutter.ActorAlign.CENTER,
+                style: 'margin-left: 4px;',
+            });
+
+            this._indicatorBox.add_child(this._indicatorIcon);
+            this._indicatorBox.add_child(this._indicatorLabel);
+            this._indicator.add_child(this._indicatorBox);
+
             Main.panel.addToStatusArea('vram-booster', this._indicator);
             if (this._currentApp)
-                this._indicatorLabel.set_text(`VRAM: ${this._currentApp}`);
+                this._indicatorLabel.set_text(this._currentApp);
         } else if (!show && this._indicator) {
             this._indicator.destroy();
             this._indicator = null;
+            this._indicatorBox = null;
+            this._indicatorIcon = null;
             this._indicatorLabel = null;
         }
     }
@@ -70,7 +88,7 @@ export default class VramBoosterExtension extends Extension {
     _updateIndicatorText(appName) {
         this._currentApp = appName;
         if (this._indicatorLabel)
-            this._indicatorLabel.set_text(appName ? `VRAM: ${appName}` : 'VRAM: idle');
+            this._indicatorLabel.set_text(appName ? appName : 'idle');
     }
 
     enable() {
@@ -126,6 +144,8 @@ export default class VramBoosterExtension extends Extension {
         if (this._indicator) {
             this._indicator.destroy();
             this._indicator = null;
+            this._indicatorBox = null;
+            this._indicatorIcon = null;
             this._indicatorLabel = null;
         }
         this._proxy = null;
