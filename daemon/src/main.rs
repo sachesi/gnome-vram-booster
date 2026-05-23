@@ -7,9 +7,9 @@ use zbus::{connection, interface};
 fn read_dmem_capacity() -> Option<(String, u64)> {
     let content = fs::read_to_string("/sys/fs/cgroup/dmem.capacity").ok()?;
     for line in content.lines() {
-        let mut parts = line.splitn(2, ' ');
-        let key = parts.next()?.trim();
-        let val: u64 = parts.next()?.trim().parse().ok()?;
+        let mut parts = line.split_whitespace();
+        let key = parts.next()?;
+        let val: u64 = parts.next()?.parse().ok()?;
         if key.starts_with("drm/") && val > 0 {
             return Some((key.to_string(), val));
         }
@@ -28,6 +28,9 @@ fn cgroup_path_for_pid(pid: u32) -> Option<String> {
 }
 
 async fn write_dmem_low(cgroup_dir: &str, drm_key: &str, bytes: u64) -> std::io::Result<bool> {
+    if cgroup_dir.contains("..") {
+        return Ok(false);
+    }
     let file = format!("{cgroup_dir}/dmem.low");
     if tokio::fs::metadata(&file).await.is_err() {
         return Ok(false);
