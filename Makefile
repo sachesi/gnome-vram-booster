@@ -12,11 +12,13 @@ EXT_UUID    := vram-booster@local
 EXT_SRC     := extension
 EXT_DEST    := /usr/share/gnome-shell/extensions/$(EXT_UUID)
 
-.PHONY: all build install uninstall reload logs check-deps
+.PHONY: all install uninstall reload logs check-deps
 
 all: build
 
-build:
+build: $(BIN_SRC)
+
+$(BIN_SRC): daemon/src/*.rs daemon/Cargo.toml daemon/Cargo.lock
 	cd daemon && cargo build --release
 
 check-deps:
