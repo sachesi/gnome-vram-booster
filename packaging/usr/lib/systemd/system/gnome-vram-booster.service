@@ -8,6 +8,7 @@ Type=dbus
 BusName=org.gnome.VramBooster
 ExecStart=/usr/bin/gnome-vram-booster
 Environment=RUST_LOG=info
+# VRAM_BOOST_RATIO=0.90  # uncomment to override (0.0–1.0)
 Restart=on-failure
 RestartSec=3
 

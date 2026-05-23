@@ -29,7 +29,9 @@ export default class VramBoosterExtension extends Extension {
     _readSelfPid() {
         try {
             const [, bytes] = GLib.file_get_contents('/proc/self/stat');
-            return parseInt(new TextDecoder().decode(bytes));
+            const text = new TextDecoder().decode(bytes);
+            const pid = parseInt(text.split(' ')[0], 10);
+            return Number.isFinite(pid) ? pid : 0;
         } catch {
             return 0;
         }
@@ -93,6 +95,7 @@ export default class VramBoosterExtension extends Extension {
             () => this._onDaemonAppeared(),
             () => {
                 this._proxy = null;
+                this._lastPid = 0;
                 this._updateIndicatorText(null);
             }
         );
@@ -140,6 +143,8 @@ export default class VramBoosterExtension extends Extension {
                 '/org/gnome/VramBooster',
                 null
             );
+            this._lastPid = 0;
+            this._onFocusChanged();
         } catch (e) {
             console.error('[vram-booster] proxy creation failed:', e.message);
             this._proxy = null;
@@ -167,6 +172,7 @@ export default class VramBoosterExtension extends Extension {
         const appName = this._getAppName(win);
 
         if (this._debounceId) {
+            console.log('[vram-booster] debounce reset, pid', pid, 'app', appName);
             GLib.source_remove(this._debounceId);
             this._debounceId = null;
         }

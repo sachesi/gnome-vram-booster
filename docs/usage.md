@@ -2,7 +2,42 @@
 
 ## How it works
 
-The focused window receives full VRAM priority (`dmem.low` set to total VRAM capacity). All other apps are set to zero. When focus switches, the previous app is reverted and the new one is boosted. Only apps with a systemd scope under `app.slice` can be boosted — see below for CLI-launched apps.
+The focused window receives VRAM priority (`dmem.low` set to VRAM × boost_ratio, default 90%). All other apps are set to zero. When focus switches, the previous app is reverted and the new one is boosted. Only apps with a systemd scope under `app.slice` can be boosted — see below for CLI-launched apps.
+
+The boost ratio prevents starving the compositor and other GPU consumers. Override via `VRAM_BOOST_RATIO` environment variable in the systemd service or when running manually:
+
+```
+# systemd drop-in
+sudo systemctl edit gnome-vram-booster.service
+```
+
+Add:
+
+```
+[Service]
+Environment=VRAM_BOOST_RATIO=0.85
+```
+
+## Daemon status
+
+Query the daemon's current state:
+
+```
+gnome-vram-boosterctl
+```
+
+Example output:
+
+```
+=== GNOME VRAM Booster Status ===
+Daemon:           running
+DRM key:          drm/0000:2d:00.0/vram
+VRAM total:       8573157376 (8176 MiB, 7.98 GiB)
+Boost ratio:      90%
+Boosted bytes:    7715841638 (7360 MiB, 7.19 GiB) (90% of total)
+Current unit:     app-org.example.Game.scope
+Previous cgroup:  (none)
+```
 
 ## Debug indicator
 
@@ -17,7 +52,7 @@ find /sys/fs/cgroup/user.slice -name "dmem.low" -path "*/app.slice/*" \
   | xargs grep -v " 0$" 2>/dev/null
 ```
 
-The focused app scope should show the full VRAM capacity. All others should be zero.
+The focused app scope should show 90% of VRAM capacity (boosted value). All others should be zero.
 
 Follow the daemon log:
 

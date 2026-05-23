@@ -1,6 +1,9 @@
 BINARY      := gnome-vram-booster
+CTL         := gnome-vram-boosterctl
 BIN_SRC     := daemon/target/release/$(BINARY)
-BIN_DEST    := /usr/local/bin/$(BINARY)
+CTL_SRC     := daemon/target/release/$(CTL)
+BIN_DEST    := /usr/bin/$(BINARY)
+CTL_DEST    := /usr/bin/$(CTL)
 SERVICE     := packaging/usr/lib/systemd/system/$(BINARY).service
 SERVICE_DIR := /usr/lib/systemd/system
 DBUS_CONF   := packaging/usr/share/dbus-1/system.d/org.gnome.VramBooster.conf
@@ -23,6 +26,7 @@ check-deps:
 
 install: check-deps build
 	sudo install -Dm755 $(BIN_SRC) $(BIN_DEST)
+	sudo install -Dm755 $(CTL_SRC) $(CTL_DEST)
 	sudo install -Dm644 $(SERVICE) $(SERVICE_DIR)/$(BINARY).service
 	sudo install -Dm644 $(DBUS_CONF) $(DBUS_DIR)/org.gnome.VramBooster.conf
 	sudo systemctl daemon-reload
@@ -36,7 +40,7 @@ install: check-deps build
 
 uninstall:
 	-sudo systemctl disable --now $(BINARY).service
-	-sudo rm -f $(BIN_DEST) $(SERVICE_DIR)/$(BINARY).service $(DBUS_DIR)/org.gnome.VramBooster.conf
+	-sudo rm -f $(BIN_DEST) $(CTL_DEST) $(SERVICE_DIR)/$(BINARY).service $(DBUS_DIR)/org.gnome.VramBooster.conf
 	-sudo systemctl daemon-reload
 	-sudo rm -rf $(EXT_DEST)
 	@echo ""

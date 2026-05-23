@@ -1,6 +1,6 @@
 [package]
 name = "gnome-vram-booster"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 authors = ["sachesi <xsachesi@pm.me>"]
 description = "GNOME daemon for dynamic VRAM prioritization via dmem cgroups"
@@ -10,9 +10,13 @@ license = "GPL-3.0-or-later"
 name = "gnome-vram-booster"
 path = "src/main.rs"
 
+[[bin]]
+name = "gnome-vram-boosterctl"
+path = "src/ctl.rs"
+
 [dependencies]
 zbus = { version = "4", default-features = false, features = ["tokio"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal"] }
 zvariant = "4"
 tracing = "0.1"
 tracing-subscriber = "0.3"
