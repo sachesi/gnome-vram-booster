@@ -166,7 +166,7 @@ export default class VramBoosterExtension extends Extension {
             this._lastPid = 0;
             this._onFocusChanged();
         } catch (e) {
-            console.error('[vram-booster] proxy creation failed:', e.message);
+            console.error('[vram-booster] Failed to connect to daemon D-Bus interface:', e.message);
             this._proxy = null;
         }
     }
@@ -204,14 +204,14 @@ export default class VramBoosterExtension extends Extension {
                 try {
                     this._proxy.FocusChangedRemote(pid, (result, error) => {
                         if (error) {
-                            console.error('[vram-booster] D-Bus call failed:', error.message);
+                            console.error(`[vram-booster] Failed to notify daemon of focus change for PID ${pid}:`, error.message);
                             return;
                         }
                         const boosted = result && result[0];
                         this._updateIndicatorText(boosted ? appName : null);
                     });
                 } catch (e) {
-                    console.error('[vram-booster] D-Bus call failed:', e.message);
+                    console.error(`[vram-booster] Failed to invoke FocusChangedRemote for PID ${pid}:`, e.message);
                 }
             }
             return GLib.SOURCE_REMOVE;

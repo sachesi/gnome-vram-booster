@@ -122,7 +122,7 @@ impl Inner {
             match write_dmem_low(prev, &self.drm_key, 0).await {
                 Ok(true) => info!("dmem.low=0 \u{2190} {}", unit_label(prev)),
                 Ok(false) => info!("dmem.low missing (scope gone?): {}", unit_label(prev)),
-                Err(e) => warn!("revert failed for {}: {e}", unit_label(prev)),
+                Err(e) => warn!("Failed to revert dmem.low to 0 for {}: {e}", unit_label(prev)),
             }
         }
         self.prev_cgroup = None;
@@ -153,8 +153,8 @@ impl Inner {
 
         match write_dmem_low(&cgroup, &self.drm_key, boost).await {
             Ok(true) => info!("dmem.low={boost} \u{2192} {label}"),
-            Ok(false) => warn!("dmem.low missing \u{2014} is dmemcg-booster running? ({label})"),
-            Err(e) => warn!("boost failed for {label}: {e}"),
+            Ok(false) => warn!("Failed to boost {label}: dmem.low missing. Is dmemcg-booster running?"),
+            Err(e) => warn!("Failed to write dmem.low boost for {label}: {e}"),
         }
 
         self.prev_cgroup = Some(cgroup);
