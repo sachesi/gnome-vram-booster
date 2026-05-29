@@ -6,15 +6,31 @@ use zbus::{connection, interface};
 
 fn read_dmem_capacity() -> Option<(String, u64)> {
     let content = fs::read_to_string("/sys/fs/cgroup/dmem.capacity").ok()?;
-    for line in content.lines() {
-        let mut parts = line.split_whitespace();
-        let key = parts.next()?;
-        let val: u64 = parts.next()?.parse().ok()?;
-        if key.starts_with("drm/") && val > 0 {
-            return Some((key.to_string(), val));
-        }
+    let entries: Vec<(String, u64)> = content
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let key = parts.next()?;
+            let val: u64 = parts.next()?.parse().ok()?;
+            if key.starts_with("drm/") && val > 0 {
+                Some((key.to_string(), val))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if let Ok(override_key) = std::env::var("DRM_KEY") {
+        return entries
+            .into_iter()
+            .find(|(k, _)| *k == override_key)
+            .or_else(|| {
+                warn!("DRM_KEY={override_key} not found in dmem.capacity");
+                None
+            });
     }
-    None
+
+    entries.into_iter().max_by_key(|(_, v)| *v)
 }
 
 fn cgroup_path_for_pid(pid: u32) -> Option<String> {
@@ -32,11 +48,23 @@ async fn write_dmem_low(cgroup_dir: &str, drm_key: &str, bytes: u64) -> std::io:
         return Ok(false);
     }
     let file = format!("{cgroup_dir}/dmem.low");
-    if tokio::fs::metadata(&file).await.is_err() {
-        return Ok(false);
+    let drm_key = drm_key.to_string();
+    let cgroup_dir = cgroup_dir.to_string();
+    match tokio::time::timeout(std::time::Duration::from_secs(2), async move {
+        if tokio::fs::metadata(&file).await.is_err() {
+            return Ok::<bool, std::io::Error>(false);
+        }
+        tokio::fs::write(&file, format!("{drm_key} {bytes}\n")).await?;
+        Ok(true)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            warn!("write_dmem_low timed out for {cgroup_dir}");
+            Ok(false)
+        }
     }
-    tokio::fs::write(&file, format!("{drm_key} {bytes}\n")).await?;
-    Ok(true)
 }
 
 fn is_app_scope(cgroup_dir: &str) -> bool {
@@ -170,9 +198,14 @@ struct VramBoosterService {
 #[interface(name = "org.gnome.VramBooster")]
 impl VramBoosterService {
     async fn focus_changed(&self, pid: u32) -> bool {
-        let cgroup = tokio::task::spawn_blocking(move || find_app_scope_for_pid(pid, 3))
-            .await
-            .unwrap_or_default();
+        let cgroup = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            tokio::task::spawn_blocking(move || find_app_scope_for_pid(pid, 3)),
+        )
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .flatten();
         self.inner.lock().await.handle_focus(cgroup, pid).await
     }
 

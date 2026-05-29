@@ -6,5 +6,9 @@
       <default>false</default>
       <summary>Show active boosted app in panel</summary>
     </key>
+    <key type="as" name="excluded-wm-classes">
+      <default>[]</default>
+      <summary>WM class names to skip VRAM boosting (case-insensitive)</summary>
+    </key>
   </schema>
 </schemalist>

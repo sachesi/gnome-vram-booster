@@ -22,6 +22,23 @@ export default class VramBoosterPrefs extends ExtensionPreferences {
 
         group.add(row);
         page.add(group);
+
+        const excludeGroup = new Adw.PreferencesGroup({title: 'Exclusions'});
+        const excludeRow = new Adw.EntryRow({
+            title: 'Excluded WM classes',
+            show_apply_button: true,
+        });
+        excludeRow.set_text(settings.get_strv('excluded-wm-classes').join(', '));
+        excludeRow.connect('apply', () => {
+            const val = excludeRow.get_text()
+                .split(',')
+                .map(s => s.trim().toLowerCase())
+                .filter(s => s.length > 0);
+            settings.set_strv('excluded-wm-classes', val);
+        });
+        excludeGroup.add(excludeRow);
+        page.add(excludeGroup);
+
         window.add(page);
     }
 }

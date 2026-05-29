@@ -19,12 +19,6 @@ const VRAM_BOOSTER_IFACE = `
 
 const DEBOUNCE_MS = 300;
 
-const PORTAL_WM_CLASSES = new Set([
-    'nautilus',
-    'org.gnome.nautilus',
-    'xdg-desktop-portal-gnome',
-]);
-
 export default class VramBoosterExtension extends Extension {
     _readSelfPid() {
         try {
@@ -74,8 +68,7 @@ export default class VramBoosterExtension extends Extension {
             this._indicator.add_child(this._indicatorBox);
 
             Main.panel.addToStatusArea('vram-booster', this._indicator);
-            if (this._currentApp)
-                this._indicatorLabel.set_text(this._currentApp);
+            this._updateIndicatorText(this._currentApp);
         } else if (!show && this._indicator) {
             this._indicator.destroy();
             this._indicator = null;
@@ -87,8 +80,12 @@ export default class VramBoosterExtension extends Extension {
 
     _updateIndicatorText(appName) {
         this._currentApp = appName;
-        if (this._indicatorLabel)
-            this._indicatorLabel.set_text(appName ? appName : 'idle');
+        if (this._indicatorLabel) {
+            if (!this._daemonOnline)
+                this._indicatorLabel.set_text('offline');
+            else
+                this._indicatorLabel.set_text(appName ? appName : 'idle');
+        }
     }
 
     enable() {
@@ -100,6 +97,8 @@ export default class VramBoosterExtension extends Extension {
         this._indicator = null;
         this._indicatorLabel = null;
         this._currentApp = null;
+        this._daemonOnline = false;
+        this._enabled = true;
 
         this._settings = this.getSettings();
         this._settingsSig = this._settings.connect('changed::debug-show-active', () => {
@@ -113,6 +112,7 @@ export default class VramBoosterExtension extends Extension {
             () => this._onDaemonAppeared(),
             () => {
                 this._proxy = null;
+                this._daemonOnline = false;
                 this._lastPid = 0;
                 this._updateIndicatorText(null);
             }
@@ -125,6 +125,7 @@ export default class VramBoosterExtension extends Extension {
     }
 
     disable() {
+        this._enabled = false;
         if (this._focusSig) {
             global.display.disconnect(this._focusSig);
             this._focusSig = null;
@@ -149,12 +150,14 @@ export default class VramBoosterExtension extends Extension {
             this._indicatorLabel = null;
         }
         this._proxy = null;
+        this._daemonOnline = false;
         this._settings = null;
         this._currentApp = null;
         this._lastPid = 0;
     }
 
     _onDaemonAppeared() {
+        this._daemonOnline = true;
         const VramBoosterProxy = Gio.DBusProxy.makeProxyWrapper(VRAM_BOOSTER_IFACE);
         try {
             this._proxy = new VramBoosterProxy(
@@ -186,7 +189,8 @@ export default class VramBoosterExtension extends Extension {
             return;
 
         const wmClass = (win.get_wm_class() ?? '').toLowerCase();
-        if (PORTAL_WM_CLASSES.has(wmClass))
+        const excluded = this._settings.get_strv('excluded-wm-classes');
+        if (excluded.some(c => c === wmClass))
             return;
 
         const appName = this._getAppName(win);
@@ -199,6 +203,8 @@ export default class VramBoosterExtension extends Extension {
 
         this._debounceId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, DEBOUNCE_MS, () => {
             this._debounceId = null;
+            if (!this._enabled)
+                return GLib.SOURCE_REMOVE;
             this._lastPid = pid;
             if (this._proxy) {
                 try {
