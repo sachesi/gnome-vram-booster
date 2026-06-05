@@ -57,7 +57,7 @@ The focused app scope should show 90% of VRAM capacity (boosted value). All othe
 Follow the daemon log:
 
 ```
-make logs
+just logs
 ```
 
 ## Apps launched from a terminal or custom launcher

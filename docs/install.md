@@ -35,7 +35,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ## Build and install
 
 ```
-make install
+just install
 ```
 
 This will:
@@ -52,7 +52,7 @@ This will:
 ## Uninstall
 
 ```
-make uninstall
+just uninstall
 ```
 
 Log out and back in to deactivate the extension.

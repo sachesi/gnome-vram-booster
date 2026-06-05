@@ -23,7 +23,7 @@ Dynamic VRAM prioritization for GNOME via Linux dmem cgroups. Keeps the focused 
 ## Install
 
 ```
-make install
+just install
 ```
 
 See [docs/install.md](docs/install.md) for full instructions and [docs/usage.md](docs/usage.md) for usage and troubleshooting.
