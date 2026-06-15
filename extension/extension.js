@@ -14,6 +14,9 @@ const VRAM_BOOSTER_IFACE = `
       <arg type="u" direction="in" name="pid"/>
       <arg type="b" direction="out" name="boosted"/>
     </method>
+    <method name="ClearFocus">
+      <arg type="b" direction="out" name="cleared"/>
+    </method>
   </interface>
 </node>`;
 
@@ -98,6 +101,7 @@ export default class VramBoosterExtension extends Extension {
         this._indicatorLabel = null;
         this._currentApp = null;
         this._daemonOnline = false;
+        this._idle = true;
         this._enabled = true;
 
         this._settings = this.getSettings();
@@ -111,9 +115,11 @@ export default class VramBoosterExtension extends Extension {
             Gio.BusNameWatcherFlags.NONE,
             () => this._onDaemonAppeared(),
             () => {
+                // Daemon vanished: drop the proxy and reset local state to offline.
                 this._proxy = null;
                 this._daemonOnline = false;
                 this._lastPid = 0;
+                this._idle = true;
                 this._updateIndicatorText(null);
             }
         );
@@ -151,6 +157,7 @@ export default class VramBoosterExtension extends Extension {
         }
         this._proxy = null;
         this._daemonOnline = false;
+        this._idle = true;
         this._settings = null;
         this._currentApp = null;
         this._lastPid = 0;
@@ -167,31 +174,63 @@ export default class VramBoosterExtension extends Extension {
                 null
             );
             this._lastPid = 0;
+            this._idle = true;
             this._onFocusChanged();
         } catch (e) {
             console.error('[vram-booster] Failed to connect to daemon D-Bus interface:', e.message);
             this._proxy = null;
+            this._daemonOnline = false;
+        }
+    }
+
+    // Tell the daemon to drop any active boost and go idle. Cached so we do not
+    // spam ClearFocus on every focus event once already idle.
+    _clearFocus() {
+        if (this._idle) {
+            this._updateIndicatorText(null);
+            return;
+        }
+        this._idle = true;
+        this._lastPid = 0;
+        this._updateIndicatorText(null);
+        if (!this._proxy)
+            return;
+        try {
+            this._proxy.ClearFocusRemote((result, error) => {
+                if (error)
+                    console.error('[vram-booster] ClearFocus failed:', error.message);
+            });
+        } catch (e) {
+            console.error('[vram-booster] Failed to invoke ClearFocusRemote:', e.message);
         }
     }
 
     _onFocusChanged() {
         const win = global.display.focus_window;
-        if (!win)
+        if (!win) {
+            this._clearFocus();
             return;
-        if (win.get_window_type() !== Meta.WindowType.NORMAL)
+        }
+        if (win.get_window_type() !== Meta.WindowType.NORMAL) {
+            this._clearFocus();
             return;
+        }
 
         const pid = win.get_pid();
-        if (!pid || pid <= 0 || pid === this._shellPid)
+        if (!pid || pid <= 0 || pid === this._shellPid) {
+            this._clearFocus();
             return;
+        }
 
         if (pid === this._lastPid)
             return;
 
         const wmClass = (win.get_wm_class() ?? '').toLowerCase();
         const excluded = this._settings.get_strv('excluded-wm-classes');
-        if (excluded.some(c => c === wmClass))
+        if (excluded.some(c => c === wmClass)) {
+            this._clearFocus();
             return;
+        }
 
         const appName = this._getAppName(win);
 
@@ -205,6 +244,12 @@ export default class VramBoosterExtension extends Extension {
             this._debounceId = null;
             if (!this._enabled)
                 return GLib.SOURCE_REMOVE;
+            // Focus may have moved during the debounce window. If it is no longer
+            // on this pid, drop the boost: a _clearFocus() has already run for the
+            // new target, and boosting now would strand priority on a hidden app.
+            const cur = global.display.focus_window;
+            if (!cur || cur.get_pid() !== pid)
+                return GLib.SOURCE_REMOVE;
             this._lastPid = pid;
             if (this._proxy) {
                 try {
@@ -214,6 +259,9 @@ export default class VramBoosterExtension extends Extension {
                             return;
                         }
                         const boosted = result && result[0];
+                        // boosted === false means the daemon found no app.slice and
+                        // already cleared any previous boost, so we are now idle.
+                        this._idle = !boosted;
                         this._updateIndicatorText(boosted ? appName : null);
                     });
                 } catch (e) {

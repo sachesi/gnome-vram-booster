@@ -4,9 +4,8 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 use zbus::{connection, interface};
 
-fn read_dmem_capacity() -> Option<(String, u64)> {
-    let content = fs::read_to_string("/sys/fs/cgroup/dmem.capacity").ok()?;
-    let entries: Vec<(String, u64)> = content
+fn parse_dmem_capacity(content: &str) -> Vec<(String, u64)> {
+    content
         .lines()
         .filter_map(|line| {
             let mut parts = line.split_whitespace();
@@ -18,7 +17,12 @@ fn read_dmem_capacity() -> Option<(String, u64)> {
                 None
             }
         })
-        .collect();
+        .collect()
+}
+
+fn read_dmem_capacity() -> Option<(String, u64)> {
+    let content = fs::read_to_string("/sys/fs/cgroup/dmem.capacity").ok()?;
+    let entries: Vec<(String, u64)> = parse_dmem_capacity(&content);
 
     if let Ok(override_key) = std::env::var("DRM_KEY") {
         return entries
@@ -68,7 +72,59 @@ async fn write_dmem_low(cgroup_dir: &str, drm_key: &str, bytes: u64) -> std::io:
 }
 
 fn is_app_scope(cgroup_dir: &str) -> bool {
-    cgroup_dir.contains("/app.slice/")
+    cgroup_dir.split('/').any(|c| c == "app.slice")
+}
+
+/// True if `content` (a dmem.low file body) sets `drm_key` to exactly `value`.
+fn dmem_low_has_value(content: &str, drm_key: &str, value: u64) -> bool {
+    content.lines().any(|line| {
+        let mut parts = line.split_whitespace();
+        match (parts.next(), parts.next()) {
+            (Some(k), Some(v)) => k == drm_key && v.parse::<u64>() == Ok(value),
+            _ => false,
+        }
+    })
+}
+
+/// Best-effort startup cleanup: clear dmem.low values left behind by a crashed
+/// or SIGKILLed daemon. Only clears app.slice scopes whose value for the selected
+/// drm_key equals our boost value; unrelated values are left untouched.
+fn cleanup_stale_boosts(drm_key: &str, boost_bytes: u64) -> usize {
+    fn walk(dir: &std::path::Path, drm_key: &str, boost_bytes: u64, cleared: &mut usize) {
+        let entries = match fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let ft = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            if ft.is_dir() {
+                walk(&path, drm_key, boost_bytes, cleared);
+            } else if entry.file_name() == "dmem.low" && is_app_scope(&path.to_string_lossy()) {
+                let content = match fs::read_to_string(&path) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                if dmem_low_has_value(&content, drm_key, boost_bytes) {
+                    match fs::write(&path, format!("{drm_key} 0\n")) {
+                        Ok(()) => *cleared += 1,
+                        Err(e) => warn!("startup cleanup: failed to clear {}: {e}", path.display()),
+                    }
+                }
+            }
+        }
+    }
+    let mut cleared = 0;
+    walk(
+        std::path::Path::new("/sys/fs/cgroup/user.slice"),
+        drm_key,
+        boost_bytes,
+        &mut cleared,
+    );
+    cleared
 }
 
 fn unit_label(cgroup_dir: &str) -> &str {
@@ -85,10 +141,10 @@ fn pid_comm(pid: u32) -> String {
 
 fn find_app_scope_for_pid(pid: u32, max_depth: usize) -> Option<String> {
     fn check(pid: u32, depth: usize, max_depth: usize) -> Option<String> {
-        if let Some(cg) = cgroup_path_for_pid(pid) {
-            if is_app_scope(&cg) {
-                return Some(cg);
-            }
+        if let Some(cg) = cgroup_path_for_pid(pid)
+            && is_app_scope(&cg)
+        {
+            return Some(cg);
         }
         if depth >= max_depth {
             return None;
@@ -100,7 +156,7 @@ fn find_app_scope_for_pid(pid: u32, max_depth: usize) -> Option<String> {
                 Ok(t) => t,
                 Err(_) => continue,
             };
-            let children_str = match read_trimmed(&format!("/proc/{tid}/children")) {
+            let children_str = match read_trimmed(&format!("/proc/{pid}/task/{tid}/children")) {
                 Some(s) => s,
                 None => continue,
             };
@@ -119,15 +175,19 @@ fn find_app_scope_for_pid(pid: u32, max_depth: usize) -> Option<String> {
     check(pid, 0, max_depth)
 }
 
+fn parse_boost_ratio(raw: &str) -> Option<f64> {
+    match raw.parse::<f64>() {
+        Ok(r) if (0.0..=1.0).contains(&r) => Some(r),
+        _ => None,
+    }
+}
+
 fn read_boost_ratio() -> f64 {
     match std::env::var("VRAM_BOOST_RATIO") {
-        Ok(v) => match v.parse::<f64>() {
-            Ok(r) if (0.0..=1.0).contains(&r) => r,
-            _ => {
-                warn!("VRAM_BOOST_RATIO invalid, using 0.90");
-                0.90
-            }
-        },
+        Ok(v) => parse_boost_ratio(&v).unwrap_or_else(|| {
+            warn!("VRAM_BOOST_RATIO invalid, using 0.90");
+            0.90
+        }),
         Err(_) => 0.90,
     }
 }
@@ -150,7 +210,10 @@ impl Inner {
             match write_dmem_low(prev, &self.drm_key, 0).await {
                 Ok(true) => info!("dmem.low=0 \u{2190} {}", unit_label(prev)),
                 Ok(false) => info!("dmem.low missing (scope gone?): {}", unit_label(prev)),
-                Err(e) => warn!("Failed to revert dmem.low to 0 for {}: {e}", unit_label(prev)),
+                Err(e) => warn!(
+                    "Failed to revert dmem.low to 0 for {}: {e}",
+                    unit_label(prev)
+                ),
             }
         }
         self.prev_cgroup = None;
@@ -161,11 +224,14 @@ impl Inner {
         let cgroup = match cgroup {
             Some(p) => p,
             None => {
-                info!("pid={pid} skip (no app.slice in cgroup tree)");
+                info!("pid={pid} skip (no app.slice in cgroup tree); clearing previous boost");
+                self.reset_previous().await;
                 return false;
             }
         };
 
+        // prev_cgroup is only ever set after a successful boost, so a match here
+        // means the previous boost succeeded and remains in effect.
         if self.prev_cgroup.as_deref() == Some(cgroup.as_str()) {
             return true;
         }
@@ -180,14 +246,21 @@ impl Inner {
         self.reset_previous().await;
 
         match write_dmem_low(&cgroup, &self.drm_key, boost).await {
-            Ok(true) => info!("dmem.low={boost} \u{2192} {label}"),
-            Ok(false) => warn!("Failed to boost {label}: dmem.low missing. Is dmemcg-booster running?"),
-            Err(e) => warn!("Failed to write dmem.low boost for {label}: {e}"),
+            Ok(true) => {
+                info!("dmem.low={boost} \u{2192} {label}");
+                self.prev_cgroup = Some(cgroup);
+                self.current_unit = label;
+                true
+            }
+            Ok(false) => {
+                warn!("Failed to boost {label}: dmem.low missing. Is dmemcg-booster running?");
+                false
+            }
+            Err(e) => {
+                warn!("Failed to write dmem.low boost for {label}: {e}");
+                false
+            }
         }
-
-        self.prev_cgroup = Some(cgroup);
-        self.current_unit = label;
-        true
     }
 }
 
@@ -207,6 +280,11 @@ impl VramBoosterService {
         .and_then(|r| r.ok())
         .flatten();
         self.inner.lock().await.handle_focus(cgroup, pid).await
+    }
+
+    async fn clear_focus(&self) -> bool {
+        self.inner.lock().await.reset_previous().await;
+        true
     }
 
     #[zbus(property)]
@@ -267,6 +345,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         vram_total / 1024 / 1024
     );
 
+    let cleared = cleanup_stale_boosts(&drm_key, boost_bytes);
+    info!("startup cleanup: cleared {cleared} stale dmem.low boost value(s)");
+
     let inner = Arc::new(Mutex::new(Inner {
         prev_cgroup: None,
         current_unit: String::new(),
@@ -301,4 +382,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     guard.reset_previous().await;
     info!("cleanup done, exiting");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_dmem_capacity_picks_drm_entries() {
+        let content = "drm/0000:2d:00.0/vram 8573157376\ndrm/0000:2d:00.0/gtt 0\nsystem 12345\n";
+        let entries = parse_dmem_capacity(content);
+        assert_eq!(
+            entries,
+            vec![("drm/0000:2d:00.0/vram".to_string(), 8573157376)]
+        );
+    }
+
+    #[test]
+    fn parse_dmem_capacity_ignores_malformed() {
+        assert!(parse_dmem_capacity("").is_empty());
+        assert!(parse_dmem_capacity("drm/x/vram notanumber\njunk\n").is_empty());
+    }
+
+    #[test]
+    fn parse_boost_ratio_bounds() {
+        assert_eq!(parse_boost_ratio("0.85"), Some(0.85));
+        assert_eq!(parse_boost_ratio("0"), Some(0.0));
+        assert_eq!(parse_boost_ratio("1"), Some(1.0));
+        assert_eq!(parse_boost_ratio("1.5"), None);
+        assert_eq!(parse_boost_ratio("-0.1"), None);
+        assert_eq!(parse_boost_ratio("abc"), None);
+    }
+
+    #[test]
+    fn is_app_scope_exact_component_only() {
+        assert!(is_app_scope(
+            "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-foo.scope"
+        ));
+        assert!(!is_app_scope("/sys/fs/cgroup/user.slice/session.slice"));
+        // substring that is not an exact path component must not match
+        assert!(!is_app_scope("/sys/fs/cgroup/my-app.slice-x/foo"));
+    }
+
+    #[test]
+    fn dmem_low_has_value_matches_exact_key_and_value() {
+        let body = "drm/0000:2d:00.0/vram 7715841638\n";
+        assert!(dmem_low_has_value(
+            body,
+            "drm/0000:2d:00.0/vram",
+            7715841638
+        ));
+        assert!(!dmem_low_has_value(body, "drm/0000:2d:00.0/vram", 0));
+        assert!(!dmem_low_has_value(body, "drm/other/vram", 7715841638));
+        assert!(!dmem_low_has_value("", "drm/0000:2d:00.0/vram", 7715841638));
+    }
 }

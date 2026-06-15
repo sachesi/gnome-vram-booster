@@ -17,10 +17,20 @@ default: build
 build:
     cd daemon && cargo build --release
 
+check:
+    cd daemon && cargo fmt --check
+    cd daemon && cargo clippy -- -D warnings
+    cd daemon && cargo test
+    glib-compile-schemas --strict extension/schemas
+
 check-deps:
+    @grep -qw dmem /sys/fs/cgroup/cgroup.controllers || \
+        { echo "ERROR: 'dmem' controller missing from /sys/fs/cgroup/cgroup.controllers. Need kernel 6.12+ with dmem cgroup support."; exit 1; }
     @systemctl is-active --quiet dmemcg-booster.service || \
-        { echo "ERROR: dmemcg-booster.service is not running. Install and start it first."; exit 1; }
-    @echo "dmemcg-booster.service OK"
+        { echo "ERROR: system dmemcg-booster.service is not active. Run: sudo systemctl enable --now dmemcg-booster.service"; exit 1; }
+    @systemctl --user is-active --quiet dmemcg-booster.service || \
+        { echo "ERROR: user dmemcg-booster.service is not active. Run: systemctl --user enable --now dmemcg-booster.service"; exit 1; }
+    @echo "deps OK: dmem controller present, system + user dmemcg-booster active"
 
 install: check-deps build
     sudo install -Dm755 {{bin_src}} {{bin_dest}}

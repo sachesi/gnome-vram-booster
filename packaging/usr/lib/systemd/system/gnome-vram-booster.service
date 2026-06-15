@@ -12,5 +12,36 @@ Environment=RUST_LOG=warn
 Restart=on-failure
 RestartSec=3
 
+# Hardening. Must preserve: reading /proc/<pid>/cgroup and
+# /proc/<pid>/task/*/children, and writing /sys/fs/cgroup/**/dmem.low.
+#
+# Deliberately NOT set, would break required access:
+#   ProtectControlGroups=true  -> /sys/fs/cgroup read-only, kills dmem.low writes
+#   ProtectKernelTunables=true -> /sys read-only, breaks dmem.low writes
+#   ProtectProc= / ProcSubset= -> restricts the /proc/<pid> reads we depend on
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/sys/fs/cgroup
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RemoveIPC=true
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# dmem.low files under user@<uid>.service are user-owned; root needs DAC_OVERRIDE.
+CapabilityBoundingSet=CAP_DAC_OVERRIDE
+UMask=0077
+
 [Install]
 WantedBy=multi-user.target

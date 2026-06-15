@@ -74,7 +74,7 @@ async fn main() {
     println!("Daemon:           running");
     println!(
         "DRM key:          {}",
-        props.get("DrmKey").map_or("?".into(), |v| format_val(v))
+        props.get("DrmKey").map_or("?".into(), format_val)
     );
     println!("VRAM total:       {}", human_bytes(total));
     println!("Boost ratio:      {:.0}%", boost_ratio * 100.0);
@@ -89,14 +89,10 @@ async fn main() {
     );
     println!(
         "Current unit:     {}",
-        props
-            .get("CurrentUnit")
-            .map_or("(none)".into(), |v| format_val(v))
+        props.get("CurrentUnit").map_or("(none)".into(), format_val)
     );
     println!(
         "Previous cgroup:  {}",
-        props
-            .get("PrevCgroup")
-            .map_or("(none)".into(), |v| format_val(v))
+        props.get("PrevCgroup").map_or("(none)".into(), format_val)
     );
 }
