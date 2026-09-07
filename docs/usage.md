@@ -36,7 +36,7 @@ VRAM total:       8573157376 (8176 MiB, 7.98 GiB)
 Boost ratio:      90%
 Boosted bytes:    7715841638 (7360 MiB, 7.19 GiB) (90% of total)
 Current unit:     app-org.example.Game.scope
-Previous cgroup:  (none)
+Boosted cgroup:   (none)
 ```
 
 ## Debug indicator
