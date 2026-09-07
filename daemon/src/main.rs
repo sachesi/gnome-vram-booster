@@ -47,27 +47,45 @@ fn cgroup_path_for_pid(pid: u32) -> Option<String> {
     None
 }
 
-async fn write_dmem_low(cgroup_dir: &str, drm_key: &str, bytes: u64) -> std::io::Result<bool> {
+/// What a `dmem.low` write did, so a caller can tell a scope that has no
+/// `dmem.low` from one whose write did not finish in time.
+#[derive(Debug, PartialEq, Eq)]
+enum WriteOutcome {
+    Wrote,
+    Missing,
+    TimedOut,
+}
+
+async fn write_dmem_low(
+    cgroup_dir: &str,
+    drm_key: &str,
+    bytes: u64,
+) -> std::io::Result<WriteOutcome> {
     if cgroup_dir.contains("..") {
-        return Ok(false);
+        return Ok(WriteOutcome::Missing);
     }
     let file = format!("{cgroup_dir}/dmem.low");
     let drm_key = drm_key.to_string();
-    let cgroup_dir = cgroup_dir.to_string();
     match tokio::time::timeout(std::time::Duration::from_secs(2), async move {
         if tokio::fs::metadata(&file).await.is_err() {
-            return Ok::<bool, std::io::Error>(false);
+            return Ok::<WriteOutcome, std::io::Error>(WriteOutcome::Missing);
         }
         tokio::fs::write(&file, format!("{drm_key} {bytes}\n")).await?;
-        Ok(true)
+        Ok(WriteOutcome::Wrote)
     })
     .await
     {
         Ok(result) => result,
-        Err(_) => {
-            warn!("write_dmem_low timed out for {cgroup_dir}");
-            Ok(false)
-        }
+        Err(_) => Ok(WriteOutcome::TimedOut),
+    }
+}
+
+/// True if the cgroup's `dmem.low` currently holds `value` for `drm_key`.
+/// Used to notice a boost that something else reverted.
+async fn dmem_low_is(cgroup_dir: &str, drm_key: &str, value: u64) -> bool {
+    match tokio::fs::read_to_string(format!("{cgroup_dir}/dmem.low")).await {
+        Ok(content) => dmem_low_has_value(&content, drm_key, value),
+        Err(_) => false,
     }
 }
 
@@ -208,8 +226,14 @@ impl Inner {
     async fn reset_previous(&mut self) {
         if let Some(ref prev) = self.prev_cgroup {
             match write_dmem_low(prev, &self.drm_key, 0).await {
-                Ok(true) => info!("dmem.low=0 \u{2190} {}", unit_label(prev)),
-                Ok(false) => info!("dmem.low missing (scope gone?): {}", unit_label(prev)),
+                Ok(WriteOutcome::Wrote) => info!("dmem.low=0 \u{2190} {}", unit_label(prev)),
+                Ok(WriteOutcome::Missing) => {
+                    info!("dmem.low missing (scope gone?): {}", unit_label(prev));
+                }
+                Ok(WriteOutcome::TimedOut) => warn!(
+                    "Reverting dmem.low to 0 for {} did not finish in 2 s",
+                    unit_label(prev)
+                ),
                 Err(e) => warn!(
                     "Failed to revert dmem.low to 0 for {}: {e}",
                     unit_label(prev)
@@ -230,30 +254,39 @@ impl Inner {
             }
         };
 
-        // prev_cgroup is only ever set after a successful boost, so a match here
-        // means the previous boost succeeded and remains in effect.
-        if self.prev_cgroup.as_deref() == Some(cgroup.as_str()) {
-            return true;
-        }
-
         let label = unit_label(&cgroup).to_string();
         let boost = self.boost_bytes();
+
+        // Same cgroup as last time. Trusting in-memory state would hide a boost
+        // that something else reverted, so the file decides.
+        if self.prev_cgroup.as_deref() == Some(cgroup.as_str()) {
+            if dmem_low_is(&cgroup, &self.drm_key, boost).await {
+                return true;
+            }
+            info!("the boost on {label} was reverted from outside, applying it again");
+        }
         let comm = tokio::task::spawn_blocking(move || pid_comm(pid))
             .await
             .unwrap_or_default();
         info!("focus pid={pid} ({comm}) \u{2192} dmem.low={boost} \u{2192} {label}");
 
-        self.reset_previous().await;
+        if self.prev_cgroup.as_deref() != Some(cgroup.as_str()) {
+            self.reset_previous().await;
+        }
 
         match write_dmem_low(&cgroup, &self.drm_key, boost).await {
-            Ok(true) => {
+            Ok(WriteOutcome::Wrote) => {
                 info!("dmem.low={boost} \u{2192} {label}");
                 self.prev_cgroup = Some(cgroup);
                 self.current_unit = label;
                 true
             }
-            Ok(false) => {
-                warn!("Failed to boost {label}: dmem.low missing. Is dmemcg-booster running?");
+            Ok(WriteOutcome::Missing) => {
+                warn!("Failed to boost {label}: it has no dmem.low. Is dmemcg-booster running?");
+                false
+            }
+            Ok(WriteOutcome::TimedOut) => {
+                warn!("Failed to boost {label}: the write to dmem.low did not finish in 2 s");
                 false
             }
             Err(e) => {
@@ -345,9 +378,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         vram_total / 1024 / 1024
     );
 
-    let cleared = cleanup_stale_boosts(&drm_key, boost_bytes);
-    info!("startup cleanup: cleared {cleared} stale dmem.low boost value(s)");
-
+    let cleanup_key = drm_key.clone();
     let inner = Arc::new(Mutex::new(Inner {
         prev_cgroup: None,
         current_unit: String::new(),
@@ -366,6 +397,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?
         .build()
         .await?;
+
+    // After the bus name, never before: a second instance has to fail claiming
+    // it while the running one still owns the boost it applied.
+    let cleared = cleanup_stale_boosts(&cleanup_key, boost_bytes);
+    info!("startup cleanup: cleared {cleared} stale dmem.low boost value(s)");
 
     info!("gnome-vram-booster ready on system bus (org.gnome.VramBooster)");
 

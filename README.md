@@ -67,11 +67,12 @@ number cleared is logged.
 
 Boost ratio defaults to 0.90 (90% of VRAM), which is **aggressive** — it leaves
 little headroom for the compositor and other GPU consumers. Lower it (e.g. 0.80)
-if you see compositor stutter or eviction of background apps. Override via
-`VRAM_BOOST_RATIO`:
+if you see compositor stutter or eviction of background apps. Override it in the
+unit, since only one instance can hold the bus name:
 
 ```
-VRAM_BOOST_RATIO=0.80 gnome-vram-booster
+sudo systemctl edit gnome-vram-booster.service   # [Service] Environment=VRAM_BOOST_RATIO=0.80
+sudo systemctl restart gnome-vram-booster.service
 ```
 
 Query daemon status:
