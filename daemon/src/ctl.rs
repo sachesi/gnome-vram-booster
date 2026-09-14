@@ -69,6 +69,7 @@ async fn main() {
     let total = get_u64(&props, "VramTotal").unwrap_or(0);
     let boosted = get_u64(&props, "BoostedBytes").unwrap_or(0);
     let boost_ratio = get_f64(&props, "BoostRatio").unwrap_or(0.0);
+    let cpu_boost_weight = get_u64(&props, "CpuBoostWeight").unwrap_or(0);
 
     println!("=== GNOME VRAM Booster Status ===");
     println!("Daemon:           running");
@@ -87,6 +88,11 @@ async fn main() {
             0
         }
     );
+    if cpu_boost_weight > 0 {
+        println!("CPU boost weight: {}", cpu_boost_weight);
+    } else {
+        println!("CPU boost:        disabled");
+    }
     println!(
         "Current unit:     {}",
         props.get("CurrentUnit").map_or("(none)".into(), format_val)

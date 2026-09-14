@@ -26,9 +26,9 @@ check:
 check-deps:
     @grep -qw dmem /sys/fs/cgroup/cgroup.controllers || \
         { echo "ERROR: 'dmem' controller missing from /sys/fs/cgroup/cgroup.controllers. Need kernel 6.12+ with dmem cgroup support."; exit 1; }
-    @systemctl is-active --quiet dmemcg-booster.service || \
+    @(systemctl is-active --quiet dmemcg-booster.service || systemctl is-active --quiet dmemcg-booster-system.service) || \
         { echo "ERROR: system dmemcg-booster.service is not active. Run: sudo systemctl enable --now dmemcg-booster.service"; exit 1; }
-    @systemctl --user is-active --quiet dmemcg-booster.service || \
+    @(systemctl --user is-active --quiet dmemcg-booster.service || systemctl --user is-active --quiet dmemcg-booster-user.service) || \
         { echo "ERROR: user dmemcg-booster.service is not active. Run: systemctl --user enable --now dmemcg-booster.service"; exit 1; }
     @echo "deps OK: dmem controller present, system + user dmemcg-booster active"
 
