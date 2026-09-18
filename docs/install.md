@@ -26,7 +26,7 @@ sudo systemctl enable --now dmemcg-booster.service
 systemctl --user enable --now dmemcg-booster.service
 ```
 
-**3. Rust toolchain**
+**3. Rust toolchain**, only where you build
 
 ```
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -35,13 +35,13 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ## Build and install
 
 ```
+just build
 just install
 ```
 
-This will:
+`just build` runs `cargo build --release` and needs the Rust toolchain. `just install` never builds: it only checks that `daemon/target/release/` holds the binaries, so a machine without Rust, such as the host when you build in a container, can install binaries built elsewhere. Run it as your user, not with `sudo`: it calls `sudo` itself, and under `sudo` its check of the user `dmemcg-booster.service` would ask root's service manager instead of yours. `just install` will:
 
-- Build the daemon with `cargo build --release`
-- Install the binary to `/usr/bin/gnome-vram-booster`
+- Install the binaries to `/usr/bin/gnome-vram-booster` and `/usr/bin/gnome-vram-boosterctl`
 - Install the systemd service to `/usr/lib/systemd/system/`
 - Install the D-Bus policy to `/usr/share/dbus-1/system.d/`
 - Copy the GNOME Shell extension to `/usr/share/gnome-shell/extensions/`
@@ -56,3 +56,12 @@ just uninstall
 ```
 
 Log out and back in to deactivate the extension.
+
+## Updating after code changes
+
+```
+just build
+just reload
+```
+
+Reinstalls the binaries from `daemon/target/release/` and the extension, and restarts the daemon.

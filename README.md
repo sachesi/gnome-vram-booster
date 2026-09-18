@@ -10,7 +10,7 @@ Dynamic VRAM prioritization for GNOME via Linux dmem cgroups. Keeps the focused 
 - [`dmemcg-booster`](https://pixelcluster.github.io/VRAM-Mgmt-fixed/) — both the **system** service (propagates dmem into user session cgroups) and the **user** service (propagates dmem into app scopes) must be active
 - GNOME Shell 45–50 (Wayland session)
 - AMD GPU (`amdgpu` driver)
-- [`just`](https://github.com/casey/just) and a Rust toolchain to build/install
+- [`just`](https://github.com/casey/just); a Rust toolchain to build, which the machine you install on does not need
 
 ## Hardware support
 
@@ -26,7 +26,8 @@ Dynamic VRAM prioritization for GNOME via Linux dmem cgroups. Keeps the focused 
 ## Install
 
 ```
-just install
+just build      # needs a Rust toolchain, e.g. in a container
+just install    # on the host, as your user: it calls sudo itself
 ```
 
 See [docs/install.md](docs/install.md) for full instructions and [docs/usage.md](docs/usage.md) for usage and troubleshooting.
