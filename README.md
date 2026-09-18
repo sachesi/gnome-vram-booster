@@ -6,7 +6,7 @@ Dynamic VRAM prioritization for GNOME via Linux dmem cgroups. Keeps the focused 
 
 ## Requirements
 
-- Kernel 6.12+ with `dmem` cgroup controller
+- Kernel 6.15+, the first where amdgpu reports VRAM to the `dmem` cgroup controller (the controller came in 6.14). Up to 7.2, protection only decides what is evicted when a buffer moves back into VRAM, while a new buffer that finds VRAM full still goes to system memory; from 7.3, or with the patches CachyOS ships, a protected app's new buffer evicts unprotected ones instead, which is where most of the gain is
 - [`dmemcg-booster`](https://pixelcluster.github.io/VRAM-Mgmt-fixed/) — both the **system** service (propagates dmem into user session cgroups) and the **user** service (propagates dmem into app scopes) must be active
 - GNOME Shell 45–50 (Wayland session)
 - AMD GPU (`amdgpu` driver)
