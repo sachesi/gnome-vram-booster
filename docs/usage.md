@@ -18,11 +18,20 @@ Add:
 Environment=VRAM_BOOST_RATIO=0.85
 ```
 
+## Protecting the compositor
+
+`dmemcg-booster` sets `dmem.low` on `app.slice` to the whole of VRAM, and nothing on its sibling `session.slice`, where GNOME Shell runs. The kernel weighs protection between siblings, so next to `app.slice`, everything in `session.slice` is unprotected: once VRAM is full, any app's buffers, background apps' included, can push out the compositor's. The daemon therefore sets `dmem.low` on the `session.slice` of every user whose app it boosts to the whole of VRAM as well, which puts GNOME Shell on a par with `app.slice`: the focused app evicts background apps' buffers first, and the compositor's only when nothing unprotected is left and a buffer moves back into VRAM. The rest of `session.slice` (portals, gsd daemons, Xwayland) is covered too; it holds little VRAM. `VRAM_PROTECT_SESSION=0` turns it off:
+
+```
+[Service]
+Environment=VRAM_PROTECT_SESSION=0
+```
+
+The daemon writes it only where `session.slice`'s `dmem.low` is 0, leaves a value someone else set alone, and puts 0 back at exit where the value is still its own, like the ceiling below.
+
 ## The ceiling on `app.slice`
 
-Off by default. `dmemcg-booster` sets `dmem.low` on `app.slice` to the whole of VRAM, and nothing on GNOME Shell, which runs outside it in `session.slice`. Once VRAM is full, apps' buffers can push the compositor's buffers out; background apps' too, since `app.slice`'s protection covers them.
-
-`VRAM_RESERVE_MIB` sets `dmem.max` on the `app.slice` of every user whose app the daemon boosts to VRAM less that many MiB, which then stay with everything outside `app.slice`:
+Off by default, and mostly not needed with `session.slice` protected. It keeps VRAM for everything outside `app.slice` in a harder way: `VRAM_RESERVE_MIB` sets `dmem.max` on the `app.slice` of every user whose app the daemon boosts to VRAM less that many MiB, which then stay with the rest:
 
 ```
 [Service]
@@ -58,6 +67,7 @@ DRM key:          drm/0000:2d:00.0/vram
 VRAM total:       8573157376 (8176 MiB, 7.98 GiB)
 Boost ratio:      90%
 Boosted bytes:    7715841638 (7360 MiB, 7.19 GiB) (90% of total)
+Session low:      8573157376 (8176 MiB, 7.98 GiB)
 App ceiling:      off
 Current unit:     app-org.example.Game.scope
 Boosted cgroup:   (none)

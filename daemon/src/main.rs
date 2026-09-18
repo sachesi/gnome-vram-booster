@@ -81,22 +81,23 @@ async fn write_dmem_low(
     }
 }
 
-/// Set `dmem.max` of `cgroup_dir` for `drm_key`; None lifts it. Opened with
-/// O_NONBLOCK, which stops a kernel that reclaims down to a lowered limit
-/// (7.3 and later) from evicting in the write: the limit takes effect at
-/// once, and usage shrinks as buffers are freed. Older kernels ignore it.
-async fn write_dmem_max(
+/// Set the dmem file `name` of `cgroup_dir` to `value` for `drm_key`. Opened
+/// with O_NONBLOCK, which stops a kernel that reclaims down to a lowered
+/// dmem.max (7.3 and later) from evicting in the write: the limit takes
+/// effect at once, and usage shrinks as buffers are freed. Older kernels,
+/// and dmem.low, ignore it.
+async fn write_dmem_value(
     cgroup_dir: &str,
+    name: &str,
     drm_key: &str,
-    bytes: Option<u64>,
+    value: &str,
 ) -> std::io::Result<WriteOutcome> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     if cgroup_dir.contains("..") {
         return Ok(WriteOutcome::Missing);
     }
-    let file = format!("{cgroup_dir}/dmem.max");
-    let value = bytes.map_or_else(|| "max".to_string(), |b| b.to_string());
+    let file = format!("{cgroup_dir}/{name}");
     let body = format!("{drm_key} {value}\n");
     let write = tokio::task::spawn_blocking(move || {
         if fs::metadata(&file).is_err() {
@@ -128,21 +129,21 @@ fn dmem_entry<'a>(content: &'a str, drm_key: &str) -> Option<&'a str> {
     })
 }
 
-/// What `app_slice`'s dmem.max holds for `drm_key`, if it has one.
-async fn dmem_max_of(app_slice: &str, drm_key: &str) -> Option<String> {
-    let content = tokio::fs::read_to_string(format!("{app_slice}/dmem.max"))
+/// What the dmem file `name` of `dir` holds for `drm_key`, if anything.
+async fn dmem_value_of(dir: &str, name: &str, drm_key: &str) -> Option<String> {
+    let content = tokio::fs::read_to_string(format!("{dir}/{name}"))
         .await
         .ok()?;
     dmem_entry(&content, drm_key).map(str::to_string)
 }
 
-/// The app.slice of a user's service manager that `cgroup_dir` is in. None
-/// for any other app.slice: the ceiling is only ever put on a user's.
-fn user_app_slice(cgroup_dir: &str) -> Option<String> {
+/// The user service manager (`user@<uid>.service`) whose app.slice
+/// `cgroup_dir` is in. None for any other app.slice: the slice settings are
+/// only ever put on a user's.
+fn user_manager(cgroup_dir: &str) -> Option<String> {
     let (head, _) = cgroup_dir.split_once("/app.slice/")?;
     let manager = head.rsplit('/').next()?;
-    (manager.starts_with("user@") && manager.ends_with(".service"))
-        .then(|| format!("{head}/app.slice"))
+    (manager.starts_with("user@") && manager.ends_with(".service")).then(|| head.to_string())
 }
 
 /// True if the cgroup's `dmem.low` currently holds `value` for `drm_key`.
@@ -290,20 +291,70 @@ fn ceiling_for(vram_total: u64, reserve_mib: u64) -> Option<u64> {
         .filter(|c| *c > 0)
 }
 
-/// Where the ceiling on one app.slice stands, as last seen.
+/// Whether session.slice gets a dmem.low of the whole VRAM; on unless
+/// VRAM_PROTECT_SESSION=0.
+fn read_protect_session() -> bool {
+    match std::env::var("VRAM_PROTECT_SESSION").as_deref() {
+        Ok("0") => false,
+        Ok("1") | Err(_) => true,
+        Ok(_) => {
+            warn!("VRAM_PROTECT_SESSION invalid, protecting session.slice");
+            true
+        }
+    }
+}
+
+/// Where a slice setting on one user's slice stands, as last seen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Ceiling {
-    /// app.slice has no dmem.max for the GPU, or the write did not finish.
+enum SliceState {
+    /// The slice has no such file for the GPU, or the write did not finish.
     Unknown,
-    /// app.slice holds this daemon's ceiling.
+    /// The slice holds this daemon's value.
     Held,
-    /// Written, but the old limit stayed: a kernel before 7.3 refuses a
-    /// limit below what app.slice already uses, without an error.
+    /// Written, but the old value stayed: a kernel before 7.3 refuses a
+    /// dmem.max below what the slice already uses, without an error.
     Refused,
     /// The write failed.
     Failed,
-    /// app.slice has a limit of someone else's, which is left alone.
+    /// The slice has a value of someone else's, which is left alone.
     Foreign,
+}
+
+/// A dmem value the daemon keeps on a slice of every user whose app it
+/// boosts: the protection of session.slice, or the ceiling on app.slice. It
+/// is written only where the file holds its unset value, left alone where
+/// someone else set it, and put back at exit while it is still the daemon's.
+struct SliceSetting {
+    /// What it is, for the log.
+    what: &'static str,
+    /// The slice, below `user@<uid>.service`.
+    slice: &'static str,
+    file: &'static str,
+    /// What the file holds when nobody set it.
+    unset: &'static str,
+    value: u64,
+}
+
+impl SliceSetting {
+    fn session_protection(value: u64) -> Self {
+        Self {
+            what: "the protection of session.slice",
+            slice: "session.slice",
+            file: "dmem.low",
+            unset: "0",
+            value,
+        }
+    }
+
+    fn ceiling(value: u64) -> Self {
+        Self {
+            what: "the ceiling on app.slice",
+            slice: "app.slice",
+            file: "dmem.max",
+            unset: "max",
+            value,
+        }
+    }
 }
 
 fn read_boost_ratio() -> f64 {
@@ -322,10 +373,11 @@ struct Inner {
     drm_key: String,
     vram_total: u64,
     boost_ratio: f64,
-    /// dmem.max for app.slice, None when the ceiling is off.
-    ceiling: Option<u64>,
-    /// Each user's app.slice seen so far, with its ceiling's state.
-    ceilings: HashMap<String, Ceiling>,
+    /// What the daemon keeps on each user's session.slice and app.slice.
+    slices: Vec<SliceSetting>,
+    /// Each slice seen so far, by its directory and the setting's index in
+    /// `slices`, with the setting's state there.
+    slice_states: HashMap<(String, usize), SliceState>,
 }
 
 impl Inner {
@@ -333,84 +385,94 @@ impl Inner {
         (self.vram_total as f64 * self.boost_ratio) as u64
     }
 
-    /// Put the ceiling on `app_slice` unless it is there. Checked at every
-    /// focus change rather than once: app.slice is made anew when a user
-    /// manager restarts, and a refused ceiling is worth trying again once
-    /// app.slice uses less. A limit someone else set is left alone.
-    async fn ensure_ceiling(&mut self, app_slice: &str) {
-        let Some(ceiling) = self.ceiling else {
-            return;
-        };
-        let ours = ceiling.to_string();
-        let before = self
-            .ceilings
-            .get(app_slice)
-            .copied()
-            .unwrap_or(Ceiling::Unknown);
-        let state = match dmem_max_of(app_slice, &self.drm_key).await.as_deref() {
-            None => Ceiling::Unknown,
-            Some(v) if v == ours => Ceiling::Held,
-            Some("max") => match write_dmem_max(app_slice, &self.drm_key, Some(ceiling)).await {
-                Ok(WriteOutcome::Wrote) => {
-                    if dmem_max_of(app_slice, &self.drm_key).await.as_deref() == Some(ours.as_str())
-                    {
-                        Ceiling::Held
-                    } else {
-                        Ceiling::Refused
+    /// Put the slice settings on the slices of `manager` where they are not
+    /// there. Checked at every focus change rather than once: the slices are
+    /// made anew when a user manager restarts, and a refused value is worth
+    /// trying again.
+    async fn ensure_slices(&mut self, manager: &str) {
+        for (i, setting) in self.slices.iter().enumerate() {
+            let dir = format!("{manager}/{}", setting.slice);
+            let ours = setting.value.to_string();
+            let before = self
+                .slice_states
+                .get(&(dir.clone(), i))
+                .copied()
+                .unwrap_or(SliceState::Unknown);
+            let current = dmem_value_of(&dir, setting.file, &self.drm_key).await;
+            let state = match current.as_deref() {
+                None => SliceState::Unknown,
+                Some(v) if v == ours => SliceState::Held,
+                Some(v) if v == setting.unset => {
+                    match write_dmem_value(&dir, setting.file, &self.drm_key, &ours).await {
+                        Ok(WriteOutcome::Wrote) => {
+                            let now = dmem_value_of(&dir, setting.file, &self.drm_key).await;
+                            if now.as_deref() == Some(ours.as_str()) {
+                                SliceState::Held
+                            } else {
+                                SliceState::Refused
+                            }
+                        }
+                        Ok(_) => SliceState::Unknown,
+                        Err(e) => {
+                            if before != SliceState::Failed {
+                                warn!("cannot set {} in {dir}: {e}", setting.what);
+                            }
+                            SliceState::Failed
+                        }
                     }
                 }
-                Ok(_) => Ceiling::Unknown,
-                Err(e) => {
-                    if before != Ceiling::Failed {
-                        warn!("cannot set dmem.max on {app_slice}: {e}");
+                Some(v) => {
+                    if before != SliceState::Foreign {
+                        warn!(
+                            "{dir}/{} is {v} for {}, not this daemon's; leaving it alone",
+                            setting.file, self.drm_key
+                        );
                     }
-                    Ceiling::Failed
+                    SliceState::Foreign
                 }
-            },
-            Some(v) => {
-                if before != Ceiling::Foreign {
-                    warn!(
-                        "{app_slice} already has dmem.max={v} for {}, not this daemon's; leaving it alone",
-                        self.drm_key
-                    );
+            };
+            if state != before {
+                match state {
+                    SliceState::Held => info!(
+                        "set {} in {dir}: {}={}",
+                        setting.what, setting.file, setting.value
+                    ),
+                    SliceState::Refused => info!(
+                        "the kernel kept {dir}/{} as it was, since the slice uses more than {} bytes; trying again at the next focus change",
+                        setting.file, setting.value
+                    ),
+                    _ => {}
                 }
-                Ceiling::Foreign
             }
-        };
-        if state != before {
-            match state {
-                Ceiling::Held => info!(
-                    "{app_slice} capped at dmem.max={ceiling}, {} MiB short of VRAM",
-                    (self.vram_total - ceiling) / 1024 / 1024
-                ),
-                Ceiling::Refused => info!(
-                    "{app_slice} uses more VRAM than the ceiling of {ceiling} bytes and the kernel kept it unlimited; trying again at the next focus change"
-                ),
-                _ => {}
-            }
+            self.slice_states.insert((dir, i), state);
         }
-        self.ceilings.insert(app_slice.to_string(), state);
     }
 
-    /// Take the ceiling off every app.slice where it is still this daemon's.
-    async fn lift_ceilings(&mut self) {
-        let Some(ceiling) = self.ceiling else {
-            return;
-        };
-        let ours = ceiling.to_string();
-        for app_slice in std::mem::take(&mut self.ceilings).into_keys() {
-            if dmem_max_of(&app_slice, &self.drm_key).await.as_deref() != Some(ours.as_str()) {
+    /// Put the unset value back wherever a slice still holds the daemon's.
+    async fn restore_slices(&mut self) {
+        for (dir, i) in std::mem::take(&mut self.slice_states).into_keys() {
+            let setting = &self.slices[i];
+            let current = dmem_value_of(&dir, setting.file, &self.drm_key).await;
+            if current != Some(setting.value.to_string()) {
                 continue;
             }
-            match write_dmem_max(&app_slice, &self.drm_key, None).await {
-                Ok(WriteOutcome::Wrote) => info!("lifted the ceiling on {app_slice}"),
+            match write_dmem_value(&dir, setting.file, &self.drm_key, setting.unset).await {
+                Ok(WriteOutcome::Wrote) => info!("took off {} in {dir}", setting.what),
                 Ok(WriteOutcome::Missing) => {}
                 Ok(WriteOutcome::TimedOut) => {
-                    warn!("lifting the ceiling on {app_slice} did not finish in 2 s")
+                    warn!("taking off {} in {dir} did not finish in 2 s", setting.what)
                 }
-                Err(e) => warn!("cannot lift the ceiling on {app_slice}: {e}"),
+                Err(e) => warn!("cannot take off {} in {dir}: {e}", setting.what),
             }
         }
+    }
+
+    /// The value the daemon keeps in `file` of a slice; 0 when it keeps none.
+    fn slice_value(&self, file: &str) -> u64 {
+        self.slices
+            .iter()
+            .find(|s| s.file == file)
+            .map_or(0, |s| s.value)
     }
 
     async fn reset_previous(&mut self) {
@@ -444,8 +506,8 @@ impl Inner {
             }
         };
 
-        if let Some(app_slice) = user_app_slice(&cgroup) {
-            self.ensure_ceiling(&app_slice).await;
+        if let Some(manager) = user_manager(&cgroup) {
+            self.ensure_slices(&manager).await;
         }
 
         let label = unit_label(&cgroup).to_string();
@@ -542,7 +604,13 @@ impl VramBoosterService {
     /// dmem.max this daemon puts on each user's app.slice; 0 when off.
     #[zbus(property)]
     async fn app_slice_ceiling(&self) -> u64 {
-        self.inner.lock().await.ceiling.unwrap_or(0)
+        self.inner.lock().await.slice_value("dmem.max")
+    }
+
+    /// dmem.low the daemon puts on each user's session.slice; 0 when none.
+    #[zbus(property)]
+    async fn session_slice_low(&self) -> u64 {
+        self.inner.lock().await.slice_value("dmem.low")
     }
 
     #[zbus(property)]
@@ -578,8 +646,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if ceiling.is_none() && reserve_mib > 0 {
         warn!("VRAM_RESERVE_MIB={reserve_mib} leaves nothing of the VRAM; app.slice ceiling off");
     }
+    let protect_session = read_protect_session();
+    let mut slices = Vec::new();
+    if protect_session {
+        slices.push(SliceSetting::session_protection(vram_total));
+    }
+    if let Some(c) = ceiling {
+        slices.push(SliceSetting::ceiling(c));
+    }
     info!(
-        "GPU: {drm_key}, VRAM: {vram_total} bytes ({} MiB), boost: {boost_bytes} bytes, app.slice ceiling: {}",
+        "GPU: {drm_key}, VRAM: {vram_total} bytes ({} MiB), boost: {boost_bytes} bytes, session.slice protected: {protect_session}, app.slice ceiling: {}",
         vram_total / 1024 / 1024,
         match ceiling {
             Some(c) => format!("{c} bytes ({reserve_mib} MiB reserved)"),
@@ -594,8 +670,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         drm_key,
         vram_total,
         boost_ratio,
-        ceiling,
-        ceilings: HashMap::new(),
+        slices,
+        slice_states: HashMap::new(),
     }));
 
     let _conn = connection::Builder::system()?
@@ -627,7 +703,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut guard = inner.lock().await;
     guard.reset_previous().await;
-    guard.lift_ceilings().await;
+    guard.restore_slices().await;
     info!("cleanup done, exiting");
     Ok(())
 }
@@ -673,19 +749,19 @@ mod tests {
     }
 
     #[test]
-    fn user_app_slice_only_under_a_user_manager() {
-        let app = "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice";
+    fn user_manager_only_for_a_users_app_slice() {
+        let manager = "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service";
         assert_eq!(
-            user_app_slice(&format!("{app}/app-foo.scope")),
-            Some(app.to_string())
+            user_manager(&format!("{manager}/app.slice/app-foo.scope")),
+            Some(manager.to_string())
         );
         assert_eq!(
-            user_app_slice(&format!("{app}/app-x.slice/app-foo.scope")),
-            Some(app.to_string())
+            user_manager(&format!("{manager}/app.slice/app-x.slice/app-foo.scope")),
+            Some(manager.to_string())
         );
-        assert_eq!(user_app_slice("/sys/fs/cgroup/app.slice/foo.service"), None);
+        assert_eq!(user_manager("/sys/fs/cgroup/app.slice/foo.service"), None);
         assert_eq!(
-            user_app_slice("/sys/fs/cgroup/user.slice/user-1000.slice/session-2.scope"),
+            user_manager("/sys/fs/cgroup/user.slice/user-1000.slice/session-2.scope"),
             None
         );
     }
@@ -699,16 +775,13 @@ mod tests {
         assert_eq!(ceiling_for(8192 * mib, u64::MAX), None);
     }
 
-    /// app.slice's dmem.max is an ordinary file here: the ceiling goes onto
-    /// an unlimited app.slice, stays off one limited by someone else, and is
-    /// lifted at exit only while it is this daemon's.
+    /// The slice files are ordinary files here: a setting goes where the file
+    /// is unset, stays off one someone else set, and is put back at exit
+    /// only while it is the daemon's.
     #[tokio::test]
-    async fn the_ceiling_goes_only_where_nobody_else_set_one() {
-        let dir = std::env::temp_dir().join(format!("gvb-ceiling-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let app_slice = dir.to_string_lossy().into_owned();
-        let max = dir.join("dmem.max");
+    async fn a_slice_setting_goes_only_where_nobody_else_set_one() {
+        let manager = std::env::temp_dir().join(format!("gvb-slices-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&manager);
         let key = "drm/0000:2d:00.0/vram";
         let mut inner = Inner {
             prev_cgroup: None,
@@ -716,29 +789,57 @@ mod tests {
             drm_key: key.to_string(),
             vram_total: 1000,
             boost_ratio: 0.9,
-            ceiling: Some(900),
-            ceilings: HashMap::new(),
+            slices: vec![
+                SliceSetting::session_protection(1000),
+                SliceSetting::ceiling(900),
+            ],
+            slice_states: HashMap::new(),
         };
+        let files = [
+            (manager.join("session.slice/dmem.low"), "0", "1000"),
+            (manager.join("app.slice/dmem.max"), "max", "900"),
+        ];
+        for (file, _, _) in &files {
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+        }
+        let manager = manager.to_string_lossy().into_owned();
 
-        // no dmem.max yet: nothing is written
-        inner.ensure_ceiling(&app_slice).await;
-        assert_eq!(inner.ceilings[&app_slice], Ceiling::Unknown);
-        assert!(!max.exists());
+        // no such files yet: nothing is written
+        inner.ensure_slices(&manager).await;
+        assert!(files.iter().all(|(file, _, _)| !file.exists()));
 
-        fs::write(&max, format!("{key} max\n")).unwrap();
-        inner.ensure_ceiling(&app_slice).await;
-        assert_eq!(inner.ceilings[&app_slice], Ceiling::Held);
-        assert_eq!(fs::read_to_string(&max).unwrap(), format!("{key} 900\n"));
+        for (file, unset, _) in &files {
+            fs::write(file, format!("{key} {unset}\n")).unwrap();
+        }
+        inner.ensure_slices(&manager).await;
+        for (file, _, ours) in &files {
+            assert_eq!(fs::read_to_string(file).unwrap(), format!("{key} {ours}\n"));
+        }
+        assert!(inner.slice_states.values().all(|s| *s == SliceState::Held));
 
-        inner.lift_ceilings().await;
-        assert_eq!(fs::read_to_string(&max).unwrap(), format!("{key} max\n"));
+        inner.restore_slices().await;
+        for (file, unset, _) in &files {
+            assert_eq!(
+                fs::read_to_string(file).unwrap(),
+                format!("{key} {unset}\n")
+            );
+        }
 
-        fs::write(&max, format!("{key} 500\n")).unwrap();
-        inner.ensure_ceiling(&app_slice).await;
-        assert_eq!(inner.ceilings[&app_slice], Ceiling::Foreign);
-        inner.lift_ceilings().await;
-        assert_eq!(fs::read_to_string(&max).unwrap(), format!("{key} 500\n"));
-        let _ = fs::remove_dir_all(&dir);
+        for (file, _, _) in &files {
+            fs::write(file, format!("{key} 500\n")).unwrap();
+        }
+        inner.ensure_slices(&manager).await;
+        assert!(
+            inner
+                .slice_states
+                .values()
+                .all(|s| *s == SliceState::Foreign)
+        );
+        inner.restore_slices().await;
+        for (file, _, _) in &files {
+            assert_eq!(fs::read_to_string(file).unwrap(), format!("{key} 500\n"));
+        }
+        let _ = fs::remove_dir_all(&manager);
     }
 
     #[test]

@@ -9,12 +9,14 @@ BusName=org.gnome.VramBooster
 ExecStart=/usr/bin/gnome-vram-booster
 Environment=RUST_LOG=warn
 # VRAM_BOOST_RATIO=0.90  # uncomment to override (0.0–1.0)
+# VRAM_PROTECT_SESSION=0 # leave session.slice's dmem.low alone
 # VRAM_RESERVE_MIB=256   # cap app.slice this far below VRAM (off by default)
 Restart=on-failure
 RestartSec=3
 
 # Hardening. Must preserve: reading /proc/<pid>/cgroup and
-# /proc/<pid>/task/*/children, and writing /sys/fs/cgroup/**/dmem.low and
+# /proc/<pid>/task/*/children, and writing /sys/fs/cgroup/**/dmem.low (app
+# units and user@<uid>.service/session.slice) and
 # user@<uid>.service/app.slice/dmem.max.
 #
 # Deliberately NOT set, would break required access:

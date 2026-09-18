@@ -70,6 +70,7 @@ async fn main() {
     let boosted = get_u64(&props, "BoostedBytes").unwrap_or(0);
     let boost_ratio = get_f64(&props, "BoostRatio").unwrap_or(0.0);
     let ceiling = get_u64(&props, "AppSliceCeiling").unwrap_or(0);
+    let session_low = get_u64(&props, "SessionSliceLow").unwrap_or(0);
 
     println!("=== GNOME VRAM Booster Status ===");
     println!("Daemon:           running");
@@ -88,6 +89,11 @@ async fn main() {
             0
         }
     );
+    if session_low == 0 {
+        println!("Session low:      off");
+    } else {
+        println!("Session low:      {}", human_bytes(session_low));
+    }
     if ceiling == 0 {
         println!("App ceiling:      off");
     } else {
