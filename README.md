@@ -31,6 +31,9 @@ just install
 
 See [docs/install.md](docs/install.md) for full instructions and [docs/usage.md](docs/usage.md) for usage and troubleshooting.
 
+Arch Linux: the AUR package `gnome-vram-booster`, built from
+[packaging/aur/PKGBUILD](packaging/aur/PKGBUILD), which each release tag updates.
+
 ## Measurements
 
 The mechanism (`dmem.low`) is a real kernel-level cgroup parameter. Measurable effects include:
