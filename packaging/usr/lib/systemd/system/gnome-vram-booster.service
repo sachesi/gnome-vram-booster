@@ -9,7 +9,7 @@ BusName=org.gnome.VramBooster
 ExecStart=/usr/bin/gnome-vram-booster
 Environment=RUST_LOG=warn
 # VRAM_BOOST_RATIO=0.90  # uncomment to override (0.0–1.0)
-# VRAM_RESERVE_MIB=256   # VRAM app.slice may not take; 0 turns the ceiling off
+# VRAM_RESERVE_MIB=256   # cap app.slice this far below VRAM (off by default)
 Restart=on-failure
 RestartSec=3
 

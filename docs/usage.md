@@ -20,26 +20,26 @@ Environment=VRAM_BOOST_RATIO=0.85
 
 ## The ceiling on `app.slice`
 
-`dmemcg-booster` sets `dmem.low` on `app.slice` to the whole of VRAM, and nothing on GNOME Shell, which runs outside it in `session.slice`. Once VRAM is full, the kernel evicts unprotected buffers first, so the apps as a group can push out the compositor's buffers. The daemon sets `dmem.max` on the `app.slice` of every user whose app it boosts to VRAM less a reserve, 256 MiB by default:
+Off by default. `dmemcg-booster` sets `dmem.low` on `app.slice` to the whole of VRAM, and nothing on GNOME Shell, which runs outside it in `session.slice`. Once VRAM is full, apps' buffers can push the compositor's buffers out; background apps' too, since `app.slice`'s protection covers them.
+
+`VRAM_RESERVE_MIB` sets `dmem.max` on the `app.slice` of every user whose app the daemon boosts to VRAM less that many MiB, which then stay with everything outside `app.slice`:
 
 ```
 [Service]
-Environment=VRAM_RESERVE_MIB=512
+Environment=VRAM_RESERVE_MIB=256
 ```
 
-`0` turns the ceiling off, and so does a reserve as large as the VRAM, with a warning.
+It costs the focused app. A new buffer that would take `app.slice` past the ceiling goes straight to system memory (GTT) without evicting anything, even while background apps hold VRAM the focused app could otherwise take from them: from Linux 7.3 the kernel evicts for a protected allocation when VRAM itself is full, but not when a cgroup limit is hit. Only a buffer moved back into VRAM later evicts, inside `app.slice`, where the focused app's `dmem.low` still protects it. Up to 7.2 new buffers never evict, and the ceiling makes `app.slice`'s share of VRAM smaller by the reserve. Turn it on if GNOME Shell stutters when VRAM runs out, and compare with it off.
 
-When `app.slice` reaches the ceiling, the kernel evicts inside `app.slice`, where the focused app's `dmem.low` still protects it, and a new buffer that does not fit goes to system memory. Nothing outside `app.slice` is limited.
+A reserve as large as the VRAM turns the ceiling off, with a warning. Nothing outside `app.slice` is limited.
 
-The daemon checks the ceiling at every focus change, since `app.slice` is made anew when a user manager restarts. Up to Linux 7.2, the kernel keeps the old limit without an error if `app.slice` already uses more than the ceiling; the daemon notices and tries again at the next focus change. Linux 7.3 applies it at once. The daemon never evicts to make room: the write is non-blocking.
+The daemon checks the ceiling at every focus change, since `app.slice` is made anew when a user manager restarts. Up to Linux 7.2, the kernel keeps the old limit without an error if `app.slice` already uses more than the ceiling; the daemon notices and tries again at the next focus change. From 7.3 it applies at once. The daemon never evicts to make room: the write is non-blocking.
 
 A `dmem.max` on `app.slice` that the daemon did not write is left alone, with a warning. On exit it restores `max` where the ceiling is still its own. A daemon killed outright leaves its ceiling behind; the next start takes it over, unless `VRAM_RESERVE_MIB` changed in between, in which case logging out and in clears it.
 
 ```
 cat /sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/app.slice/dmem.max
 ```
-
-The reserve is a guess, not a measurement. Too small and the compositor still loses buffers; too large and games spill into system memory earlier than they need to.
 
 ## Daemon status
 
@@ -58,7 +58,7 @@ DRM key:          drm/0000:2d:00.0/vram
 VRAM total:       8573157376 (8176 MiB, 7.98 GiB)
 Boost ratio:      90%
 Boosted bytes:    7715841638 (7360 MiB, 7.19 GiB) (90% of total)
-App ceiling:      8304721920 (7920 MiB, 7.73 GiB) (256 MiB reserved)
+App ceiling:      off
 Current unit:     app-org.example.Game.scope
 Boosted cgroup:   (none)
 ```
