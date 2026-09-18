@@ -54,7 +54,8 @@ Suggested test cases:
 2. Rust daemon resolves PID to systemd cgroup under `app.slice`
 3. Daemon writes `dmem.low = VRAM_total * boost_ratio` to the focused app's cgroup
 4. Previous boosted cgroup is reverted to 0
-5. On daemon exit (SIGTERM/SIGINT), boosted cgroup is reset
+5. The user's `app.slice` gets `dmem.max = VRAM_total - 256 MiB`, so apps together cannot push the compositor's buffers out (see [docs/usage.md](docs/usage.md#the-ceiling-on-appslice))
+6. On daemon exit (SIGTERM/SIGINT), boosted cgroup is reset and the ceiling lifted
 
 **Idle / ClearFocus.** When focus moves to something that cannot be boosted — no
 focused window, a non-normal window, an invalid/shell PID, an excluded WM class,

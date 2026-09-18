@@ -69,6 +69,7 @@ async fn main() {
     let total = get_u64(&props, "VramTotal").unwrap_or(0);
     let boosted = get_u64(&props, "BoostedBytes").unwrap_or(0);
     let boost_ratio = get_f64(&props, "BoostRatio").unwrap_or(0.0);
+    let ceiling = get_u64(&props, "AppSliceCeiling").unwrap_or(0);
 
     println!("=== GNOME VRAM Booster Status ===");
     println!("Daemon:           running");
@@ -87,6 +88,15 @@ async fn main() {
             0
         }
     );
+    if ceiling == 0 {
+        println!("App ceiling:      off");
+    } else {
+        println!(
+            "App ceiling:      {} ({} MiB reserved)",
+            human_bytes(ceiling),
+            total.saturating_sub(ceiling) / 1024 / 1024
+        );
+    }
     println!(
         "Current unit:     {}",
         props.get("CurrentUnit").map_or("(none)".into(), format_val)

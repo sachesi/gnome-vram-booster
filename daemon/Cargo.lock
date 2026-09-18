@@ -391,6 +391,7 @@ dependencies = [
 name = "gnome-vram-booster"
 version = "0.6.2"
 dependencies = [
+ "libc",
  "tokio",
  "tracing",
  "tracing-subscriber",

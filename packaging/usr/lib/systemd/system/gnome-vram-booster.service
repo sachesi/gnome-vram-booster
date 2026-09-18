@@ -9,11 +9,13 @@ BusName=org.gnome.VramBooster
 ExecStart=/usr/bin/gnome-vram-booster
 Environment=RUST_LOG=warn
 # VRAM_BOOST_RATIO=0.90  # uncomment to override (0.0–1.0)
+# VRAM_RESERVE_MIB=256   # VRAM app.slice may not take; 0 turns the ceiling off
 Restart=on-failure
 RestartSec=3
 
 # Hardening. Must preserve: reading /proc/<pid>/cgroup and
-# /proc/<pid>/task/*/children, and writing /sys/fs/cgroup/**/dmem.low.
+# /proc/<pid>/task/*/children, and writing /sys/fs/cgroup/**/dmem.low and
+# user@<uid>.service/app.slice/dmem.max.
 #
 # Deliberately NOT set, would break required access:
 #   ProtectControlGroups=true  -> /sys/fs/cgroup read-only, kills dmem.low writes
@@ -39,7 +41,8 @@ MemoryDenyWriteExecute=true
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
-# dmem.low files under user@<uid>.service are user-owned; root needs DAC_OVERRIDE.
+# dmem.low and dmem.max files under user@<uid>.service are user-owned; root
+# needs DAC_OVERRIDE.
 CapabilityBoundingSet=CAP_DAC_OVERRIDE
 UMask=0077
 
