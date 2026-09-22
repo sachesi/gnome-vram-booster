@@ -1,92 +1,45 @@
 # gnome-vram-booster
 
-> **Experimental.** This is a local desktop tool under active development. It writes to privileged cgroup files and is not production-hardened. Test on a non-critical setup first.
+Keeps the focused window's VRAM from being evicted on GNOME. A GNOME Shell extension reports the focused window's PID to a system daemon, which, through the Linux dmem cgroup controller, protects most of the VRAM for that app's scope, taking the protection back from the app focused before, and protects `session.slice`, where GNOME Shell runs, from background apps. It matters most on GPUs with 8 GB or less, where whatever runs in the background can otherwise push the foreground app's buffers out to system memory.
 
-Dynamic VRAM prioritization for GNOME via Linux dmem cgroups. Keeps the focused app's GPU memory protected from TTM eviction on 8 GB and under GPUs. GNOME equivalent of KDE's `plasma-foreground-booster`.
+It is the GNOME counterpart of KDE's `plasma-foreground-booster`, and experimental: it writes cgroup files as root, so try it on a setup you can afford to reboot.
 
 ## Requirements
 
-- Kernel 6.15+, the first where amdgpu reports VRAM to the `dmem` cgroup controller (the controller came in 6.14). Up to 7.2, protection only decides what is evicted when a buffer moves back into VRAM, while a new buffer that finds VRAM full still goes to system memory; from 7.3, or with the patches CachyOS ships, a protected app's new buffer evicts unprotected ones instead, which is where most of the gain is
-- [`dmemcg-booster`](https://pixelcluster.github.io/VRAM-Mgmt-fixed/) — both the **system** service (propagates dmem into user session cgroups) and the **user** service (propagates dmem into app scopes) must be active
-- GNOME Shell 45–50 (Wayland session)
-- AMD GPU (`amdgpu` driver)
-- [`just`](https://github.com/casey/just); a Rust toolchain to build, which the machine you install on does not need
+- Linux 6.15 or newer, the first where amdgpu reports VRAM to the `dmem` cgroup controller (the controller came in 6.14). Up to 7.2, protection only decides what is evicted when a buffer moves back into VRAM, while a new buffer that finds VRAM full still goes to system memory; from 7.3, or with the patches CachyOS ships, a protected app's new buffer evicts unprotected ones instead, which is where most of the gain is.
+- [dmemcg-booster](https://pixelcluster.github.io/VRAM-Mgmt-fixed/), both its system and its user service.
+- GNOME Shell 45 to 50, on Wayland. X11 is untested.
+- An AMD GPU on `amdgpu`. Intel is untested; NVIDIA's proprietary driver is untested and likely lacks dmem support.
+- Apps launched into a scope of their own under `app.slice`, as the app grid does; see [docs/usage.md](docs/usage.md#apps-launched-from-a-terminal-or-custom-launcher).
 
-## Hardware support
-
-| Category | Status |
-|---|---|
-| AMD GPU (`amdgpu`), Mesa/RADV | Tested, supported |
-| NVIDIA proprietary driver | Untested, likely unsupported (no dmemcg) |
-| Intel GPU | Untested |
-| GNOME Wayland | Primary target |
-| X11 session | Untested, may work |
-| Non-GNOME desktops | Untested |
-
-## Install
+## Building and installing
 
 ```
-just build      # needs a Rust toolchain, e.g. in a container
-just install    # on the host, as your user: it calls sudo itself
+just build      # needs a Rust toolchain
+just install    # run as your user: it calls sudo itself
 ```
 
-See [docs/install.md](docs/install.md) for full instructions and [docs/usage.md](docs/usage.md) for usage and troubleshooting.
+`just install` never builds, so it can run on a machine without a Rust toolchain, such as the host when you build in a container. Log out and back in afterwards, then enable **GNOME VRAM Booster** in the Extensions app. Details and removal are in [docs/install.md](docs/install.md).
 
-Arch Linux: the AUR package `gnome-vram-booster`, built from
-[packaging/aur/PKGBUILD](packaging/aur/PKGBUILD), which each release tag updates.
+On Arch Linux, install the AUR package `gnome-vram-booster`, built from [packaging/aur/PKGBUILD](packaging/aur/PKGBUILD), which each release tag updates.
 
-## Measurements
-
-The mechanism (`dmem.low`) is a real kernel-level cgroup parameter. Measurable effects include:
-
-- **VRAM allocation under desktop idle** — GNOME compositor + background apps should see reduced dmem.low when focus shifts to a workload
-- **Frametime stability under VRAM pressure** — compare 1% and 0.1% lows with booster disabled vs enabled on 4–8 GB GPUs
-- **Eviction avoidance** — foreground app should experience fewer TTM evictions during compositor GPU activity (browser compositing, animations)
-- **Compositor behavior** — GNOME Shell may show reduced VRAM allocation when a game or GPU workload is focused
-
-Suggested test cases:
-
-- 4 GB GPU: GNOME Wayland + Firefox (several tabs) + Steam Proton game
-- 8 GB GPU: GNOME Wayland + browser + Electron/Discord + VRAM-heavy game
-
-## How it works
-
-1. GNOME Shell extension detects focused window PID
-2. Rust daemon resolves PID to systemd cgroup under `app.slice`
-3. Daemon writes `dmem.low = VRAM_total * boost_ratio` to the focused app's cgroup
-4. Previous boosted cgroup is reverted to 0
-5. Each user's `session.slice`, where GNOME Shell runs, gets `dmem.low = VRAM_total` too, so background apps cannot evict the compositor's buffers (`VRAM_PROTECT_SESSION=0` turns it off; see [docs/usage.md](docs/usage.md#protecting-the-compositor))
-6. With `VRAM_RESERVE_MIB` set, the user's `app.slice` gets `dmem.max = VRAM_total - reserve`, keeping the reserve for GNOME Shell at a cost to the focused app (off by default; see [docs/usage.md](docs/usage.md#the-ceiling-on-appslice))
-7. On daemon exit (SIGTERM/SIGINT), boosted cgroup is reset and the slice settings taken off
-
-**Idle / ClearFocus.** When focus moves to something that cannot be boosted — no
-focused window, a non-normal window, an invalid/shell PID, an excluded WM class,
-or a process with no `app.slice` scope — the extension calls `ClearFocus` and the
-daemon reverts the previously boosted cgroup to 0. This prevents stale priority
-lingering on the app you switched away from.
-
-**Startup cleanup.** If the daemon was killed (`SIGKILL`, crash) without running
-its exit cleanup, a stale `dmem.low` boost can persist. On startup the daemon
-scans `app.slice` scopes and clears only `dmem.low` entries whose value for the
-selected GPU equals its own boost value; unrelated values are left untouched. The
-number cleared is logged.
-
-Boost ratio defaults to 0.90 (90% of VRAM), which is **aggressive** — it leaves
-little headroom for the compositor and other GPU consumers. Lower it (e.g. 0.80)
-if you see compositor stutter or eviction of background apps. Override it in the
-unit, since only one instance can hold the bus name:
-
-```
-sudo systemctl edit gnome-vram-booster.service   # [Service] Environment=VRAM_BOOST_RATIO=0.80
-sudo systemctl restart gnome-vram-booster.service
-```
-
-Query daemon status:
+## Usage
 
 ```
 gnome-vram-boosterctl
 ```
 
-## License
+prints the GPU, the boost size and the unit that holds the boost. The boost is 90% of VRAM; lower it if GNOME Shell stutters:
 
-GPL-3.0-or-later
+```
+sudo systemctl edit gnome-vram-booster.service   # [Service] Environment=VRAM_BOOST_RATIO=0.80
+```
+
+`VRAM_RESERVE_MIB` caps `app.slice` that far below the VRAM size, keeping it for GNOME Shell at a cost to the focused app; it is off by default. See [docs/usage.md](docs/usage.md#the-ceiling-on-appslice).
+
+## Documentation
+
+- [Installing](docs/install.md)
+- [Usage](docs/usage.md), including apps launched from a terminal, and troubleshooting
+
+GPL-3.0-or-later.

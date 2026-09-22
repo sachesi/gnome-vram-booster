@@ -4,10 +4,17 @@
 
 The focused window receives VRAM priority (`dmem.low` set to VRAM × boost_ratio, default 90%). All other apps are set to zero. When focus switches, the previous app is reverted and the new one is boosted. Only apps with a systemd scope under `app.slice` can be boosted — see below for CLI-launched apps.
 
-The boost ratio prevents starving the compositor and other GPU consumers. Override via `VRAM_BOOST_RATIO` environment variable in the systemd service or when running manually:
+The extension sends the focused window's PID to the daemon over D-Bus, and the daemon finds the process's cgroup under `app.slice`. When focus moves to something that cannot be boosted (no focused window, a non-normal window, an invalid PID or GNOME Shell's own, an excluded WM class, or a process with no `app.slice` scope), the extension calls `ClearFocus` and the daemon takes the boost back, so the app you switched away from keeps no priority. On SIGTERM or SIGINT the daemon drops the boost, takes its settings off the slices and exits.
+
+The daemon also protects `session.slice`, and can put a ceiling on `app.slice` as a whole; see [below](#protecting-the-compositor).
+
+The GPU is the largest `drm/` entry in `/sys/fs/cgroup/dmem.capacity`; set `DRM_KEY` in the unit to pick another one.
+
+If the daemon is killed without cleaning up (`SIGKILL`, a crash), a boost can be left behind. At startup it clears every `dmem.low` under `app.slice` that holds exactly its own boost value for the selected GPU, and logs how many; any other value is left alone.
+
+A ratio of 0.90 is aggressive: it leaves little headroom for the compositor and other GPU users. Lower it (0.80, say) if the compositor stutters or background apps are evicted. Override it in the systemd service, not by running a second copy of the daemon by hand: the running instance owns the bus name.
 
 ```
-# systemd drop-in
 sudo systemctl edit gnome-vram-booster.service
 ```
 
@@ -17,6 +24,8 @@ Add:
 [Service]
 Environment=VRAM_BOOST_RATIO=0.85
 ```
+
+Then `sudo systemctl restart gnome-vram-booster.service`.
 
 ## Protecting the compositor
 
