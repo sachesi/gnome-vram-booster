@@ -252,6 +252,8 @@ fn app_unit_cgroup(cgroup_dir: &str) -> Option<String> {
 /// Best-effort startup cleanup: clear dmem.low values left behind by a crashed
 /// or SIGKILLed daemon. Only clears app.slice scopes whose value for the selected
 /// drm_key equals our boost value; unrelated values are left untouched.
+/// Slices are skipped: none is ever boosted, and dmemcg-booster gives app.slice
+/// a dmem.low of the whole VRAM, which a ratio of 1 would take for a boost.
 fn cleanup_stale_boosts(root: &Path, drm_key: &str, boost_bytes: u64) -> usize {
     fn walk(dir: &Path, drm_key: &str, boost_bytes: u64, cleared: &mut usize) {
         let entries = match fs::read_dir(dir) {
@@ -266,7 +268,10 @@ fn cleanup_stale_boosts(root: &Path, drm_key: &str, boost_bytes: u64) -> usize {
             };
             if ft.is_dir() {
                 walk(&path, drm_key, boost_bytes, cleared);
-            } else if entry.file_name() == "dmem.low" && is_app_scope(&path.to_string_lossy()) {
+            } else if entry.file_name() == "dmem.low"
+                && is_app_scope(&path.to_string_lossy())
+                && !dir.to_string_lossy().ends_with(".slice")
+            {
                 let content = match fs::read_to_string(&path) {
                     Ok(c) => c,
                     Err(_) => continue,
@@ -1090,6 +1095,32 @@ mod tests {
             app_unit_cgroup("/sys/fs/cgroup/user.slice/user-1000.slice/session-2.scope"),
             None
         );
+    }
+
+    #[test]
+    fn startup_cleanup_clears_stale_boosts_but_never_a_slice() {
+        let key = "drm/0000:2d:00.0/vram";
+        let boost = 8573157376;
+        let (root, users) = user_tree("cleanup", key, &[1000]);
+        let unit = PathBuf::from(&users[0].1);
+        let app = unit.parent().unwrap().to_path_buf();
+        let session = app.with_file_name("session.slice");
+        fs::create_dir_all(&session).unwrap();
+        // what dmemcg-booster puts on app.slice, equal to the boost at a ratio of 1
+        for dir in [&app, &unit, &session] {
+            fs::write(dir.join("dmem.low"), format!("{key} {boost}\n")).unwrap();
+        }
+        let other = app.join("app-bar.scope");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join("dmem.low"), format!("{key} 5\n")).unwrap();
+
+        assert_eq!(cleanup_stale_boosts(&root, key, boost), 1);
+        let low = |dir: &Path| fs::read_to_string(dir.join("dmem.low")).unwrap();
+        assert_eq!(low(&unit), format!("{key} 0\n"));
+        assert_eq!(low(&app), format!("{key} {boost}\n"));
+        assert_eq!(low(&session), format!("{key} {boost}\n"));
+        assert_eq!(low(&other), format!("{key} 5\n"));
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// A FIFO as `dmem.low` blocks a write until someone reads it, which is a
