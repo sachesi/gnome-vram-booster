@@ -676,6 +676,10 @@ impl Inner {
         if boosted {
             self.current_unit = unit_label(&cgroup).to_string();
             self.prev_cgroup = Some(cgroup);
+        } else if self.prev_cgroup.as_deref() == Some(cgroup.as_str()) {
+            // the boost this cgroup held is gone and could not be put back
+            self.prev_cgroup = None;
+            self.current_unit.clear();
         }
         boosted
     }
@@ -892,6 +896,7 @@ mod fifo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn inner_with(key: &str, slices: Vec<SliceSetting>, write_timeout: Duration) -> Inner {
         Inner {
@@ -905,6 +910,24 @@ mod tests {
             slice_states: HashMap::new(),
             writer: DmemWriter::new(write_timeout),
         }
+    }
+
+    /// A temp tree shaped like `/sys/fs/cgroup/user.slice`, with one app unit
+    /// per user whose dmem.low starts at 0.
+    fn user_tree(name: &str, key: &str, uids: &[u32]) -> (PathBuf, Vec<(PathBuf, String)>) {
+        let root = std::env::temp_dir().join(format!("gvb-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let users = uids
+            .iter()
+            .map(|uid| {
+                let slice = root.join(format!("user-{uid}.slice"));
+                let unit = slice.join(format!("user@{uid}.service/app.slice/app-foo.scope"));
+                fs::create_dir_all(&unit).unwrap();
+                fs::write(unit.join("dmem.low"), format!("{key} 0\n")).unwrap();
+                (slice, unit.to_string_lossy().into_owned())
+            })
+            .collect();
+        (root, users)
     }
 
     #[test]
@@ -1127,5 +1150,22 @@ mod tests {
             .unwrap();
         assert_eq!(seen, format!("{key} 900\n{key} 0\n"));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_boost_that_cannot_be_put_back_is_no_longer_reported() {
+        let key = "drm/0000:2d:00.0/vram";
+        let (root, users) = user_tree("gone", key, &[1000]);
+        let (_, unit) = users[0].clone();
+        let mut inner = inner_with(key, Vec::new(), Duration::from_secs(2));
+        let pid = std::process::id();
+
+        assert!(inner.handle_focus(Some(unit.clone()), pid).await);
+        assert_eq!(inner.current_unit, "app-foo.scope");
+        fs::remove_file(format!("{unit}/dmem.low")).unwrap();
+        assert!(!inner.handle_focus(Some(unit), pid).await);
+        assert_eq!(inner.prev_cgroup, None);
+        assert_eq!(inner.current_unit, "");
+        let _ = fs::remove_dir_all(&root);
     }
 }
