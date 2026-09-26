@@ -50,7 +50,6 @@ export default class VramBoosterExtension extends Extension {
             this._indicator = new PanelMenu.Button(0.0, 'VRAM Booster', true);
 
             this._indicatorBox = new St.BoxLayout({
-                vertical: false,
                 style_class: 'panel-status-indicators-box',
             });
 
@@ -176,7 +175,7 @@ export default class VramBoosterExtension extends Extension {
         const cancellable = new Gio.Cancellable();
         this._proxyCancellable = cancellable;
         const VramBoosterProxy = Gio.DBusProxy.makeProxyWrapper(VRAM_BOOSTER_IFACE);
-        VramBoosterProxy(
+        new VramBoosterProxy(
             Gio.DBus.system,
             'org.gnome.VramBooster',
             '/org/gnome/VramBooster',

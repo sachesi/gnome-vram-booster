@@ -8,7 +8,7 @@ It is the GNOME counterpart of KDE's `plasma-foreground-booster`, and experiment
 
 - Linux 6.15 or newer, the first where amdgpu reports VRAM to the `dmem` cgroup controller (the controller came in 6.14). Up to 7.2, protection only decides what is evicted when a buffer moves back into VRAM, while a new buffer that finds VRAM full still goes to system memory; from 7.3, or with the patches CachyOS ships, a protected app's new buffer evicts unprotected ones instead, which is where most of the gain is.
 - [dmemcg-booster](https://pixelcluster.github.io/VRAM-Mgmt-fixed/), both its system and its user service.
-- GNOME Shell 45 to 50, on Wayland. X11 is untested.
+- GNOME Shell 45 to 51, on Wayland. X11 is untested.
 - An AMD GPU on `amdgpu`. Intel is untested; NVIDIA's proprietary driver is untested and likely lacks dmem support.
 - Apps launched into a scope of their own under `app.slice`, as the app grid does; see [docs/usage.md](docs/usage.md#apps-launched-from-a-terminal-or-custom-launcher).
 
