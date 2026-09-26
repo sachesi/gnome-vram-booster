@@ -2,12 +2,19 @@ use std::collections::HashMap;
 use zbus::Connection;
 use zvariant::OwnedValue;
 
+/// Unit names and cgroup paths come from other processes, any user's, so
+/// they can carry control characters that would rewrite the terminal. Strip
+/// them.
+fn printable(raw: &str) -> String {
+    raw.chars().filter(|c| !c.is_control()).collect()
+}
+
 fn format_val(v: &OwnedValue) -> String {
     if let Ok(s) = v.downcast_ref::<String>() {
         if s.is_empty() {
             "(none)".into()
         } else {
-            s.clone()
+            printable(&s)
         }
     } else if let Ok(n) = v.downcast_ref::<u64>() {
         n.to_string()
