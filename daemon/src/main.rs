@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
+use zbus::message::Header;
 use zbus::{connection, interface};
 
 /// Trim a string that came from another process (a cgroup name, a `comm`)
@@ -247,6 +248,21 @@ fn app_unit_cgroup(cgroup_dir: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// The `user-<uid>.slice` of whoever sent a call. The daemon runs as root for
+/// every user, so a caller boosts, and takes back, only what sits in its own.
+async fn caller_slice(conn: &zbus::Connection, header: &Header<'_>) -> zbus::fdo::Result<PathBuf> {
+    let sender = header
+        .sender()
+        .ok_or_else(|| zbus::fdo::Error::AccessDenied("the call names no sender".into()))?;
+    let uid = zbus::fdo::DBusProxy::new(conn)
+        .await?
+        .get_connection_unix_user(sender.clone().into())
+        .await?;
+    Ok(PathBuf::from(format!(
+        "/sys/fs/cgroup/user.slice/user-{uid}.slice"
+    )))
 }
 
 /// Best-effort startup cleanup: clear dmem.low values left behind by a crashed
@@ -615,12 +631,25 @@ impl Inner {
         self.current_unit.clear();
     }
 
-    async fn handle_focus(&mut self, cgroup: Option<String>, pid: u32) -> bool {
+    /// Drop the boost if it sits in `caller`'s tree. A session takes back only
+    /// what was boosted for it: one user's shell losing focus must not drop
+    /// the boost another user's session holds.
+    async fn clear_for(&mut self, caller: &Path) {
+        let ours = |c: &Option<String>| {
+            c.as_deref()
+                .is_some_and(|c| Path::new(c).starts_with(caller))
+        };
+        if ours(&self.prev_cgroup) || ours(&self.unconfirmed) {
+            self.reset_previous().await;
+        }
+    }
+
+    async fn handle_focus(&mut self, cgroup: Option<String>, pid: u32, caller: &Path) -> bool {
         let cgroup = match cgroup {
             Some(p) => p,
             None => {
-                info!("pid={pid} skip (no app.slice unit); clearing previous boost");
-                self.reset_previous().await;
+                info!("pid={pid} skip (no app.slice unit); clearing the caller's boost");
+                self.clear_for(caller).await;
                 return false;
             }
         };
@@ -696,11 +725,18 @@ struct VramBoosterService {
 
 #[interface(name = "org.gnome.VramBooster")]
 impl VramBoosterService {
-    async fn focus_changed(&self, pid: u32) -> bool {
+    /// Boost the app.slice unit of `pid`, if it lies in the caller's own tree.
+    async fn focus_changed(
+        &self,
+        #[zbus(connection)] conn: &zbus::Connection,
+        #[zbus(header)] header: Header<'_>,
+        pid: u32,
+    ) -> zbus::fdo::Result<bool> {
         // The lookup reads /proc on the blocking pool, where a timeout cannot
         // cancel it. The deadline inside is what stops it; the outer timeout
         // only covers the handoff.
         const BUDGET: Duration = Duration::from_millis(500);
+        let caller = caller_slice(conn, &header).await?;
         let deadline = Instant::now() + BUDGET;
         let cgroup = tokio::time::timeout(
             BUDGET + Duration::from_millis(100),
@@ -709,13 +745,31 @@ impl VramBoosterService {
         .await
         .ok()
         .and_then(|r| r.ok())
-        .flatten();
-        self.inner.lock().await.handle_focus(cgroup, pid).await
+        .flatten()
+        .filter(|c| {
+            let ours = Path::new(c).starts_with(&caller);
+            if !ours {
+                warn!("ignoring {}: outside {}", loggable(c), caller.display());
+            }
+            ours
+        });
+        Ok(self
+            .inner
+            .lock()
+            .await
+            .handle_focus(cgroup, pid, &caller)
+            .await)
     }
 
-    async fn clear_focus(&self) -> bool {
-        self.inner.lock().await.reset_previous().await;
-        true
+    /// Drop the boost, if it is the caller's.
+    async fn clear_focus(
+        &self,
+        #[zbus(connection)] conn: &zbus::Connection,
+        #[zbus(header)] header: Header<'_>,
+    ) -> zbus::fdo::Result<bool> {
+        let caller = caller_slice(conn, &header).await?;
+        self.inner.lock().await.clear_for(&caller).await;
+        Ok(true)
     }
 
     #[zbus(property(emits_changed_signal = "false"))]
@@ -903,7 +957,6 @@ mod fifo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     fn inner_with(key: &str, slices: Vec<SliceSetting>, write_timeout: Duration) -> Inner {
         Inner {
@@ -1168,7 +1221,7 @@ mod tests {
         let cgroup = dir.to_string_lossy().into_owned();
 
         let boosted = inner
-            .handle_focus(Some(cgroup.clone()), std::process::id())
+            .handle_focus(Some(cgroup.clone()), std::process::id(), &dir)
             .await;
         assert!(!boosted);
         assert_eq!(inner.prev_cgroup, None);
@@ -1185,18 +1238,45 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// One boost for the whole system: a user's focus moves it, but only the
+    /// user it was boosted for takes it back.
+    #[tokio::test]
+    async fn a_caller_takes_back_only_its_own_boost() {
+        let key = "drm/0000:2d:00.0/vram";
+        let (root, users) = user_tree("callers", key, &[1000, 1001]);
+        let [(a, unit_a), (b, unit_b)] = [users[0].clone(), users[1].clone()];
+        let low = |unit: &str| fs::read_to_string(format!("{unit}/dmem.low")).unwrap();
+        let mut inner = inner_with(key, Vec::new(), Duration::from_secs(2));
+        let pid = std::process::id();
+
+        assert!(inner.handle_focus(Some(unit_a.clone()), pid, &a).await);
+        inner.clear_for(&b).await;
+        assert!(!inner.handle_focus(None, pid, &b).await);
+        assert_eq!(low(&unit_a), format!("{key} 900\n"));
+        assert_eq!(inner.prev_cgroup.as_deref(), Some(unit_a.as_str()));
+
+        assert!(inner.handle_focus(Some(unit_b.clone()), pid, &b).await);
+        assert_eq!(low(&unit_a), format!("{key} 0\n"));
+        assert_eq!(low(&unit_b), format!("{key} 900\n"));
+
+        inner.clear_for(&b).await;
+        assert_eq!(low(&unit_b), format!("{key} 0\n"));
+        assert_eq!(inner.prev_cgroup, None);
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[tokio::test]
     async fn a_boost_that_cannot_be_put_back_is_no_longer_reported() {
         let key = "drm/0000:2d:00.0/vram";
         let (root, users) = user_tree("gone", key, &[1000]);
-        let (_, unit) = users[0].clone();
+        let (slice, unit) = users[0].clone();
         let mut inner = inner_with(key, Vec::new(), Duration::from_secs(2));
         let pid = std::process::id();
 
-        assert!(inner.handle_focus(Some(unit.clone()), pid).await);
+        assert!(inner.handle_focus(Some(unit.clone()), pid, &slice).await);
         assert_eq!(inner.current_unit, "app-foo.scope");
         fs::remove_file(format!("{unit}/dmem.low")).unwrap();
-        assert!(!inner.handle_focus(Some(unit), pid).await);
+        assert!(!inner.handle_focus(Some(unit), pid, &slice).await);
         assert_eq!(inner.prev_cgroup, None);
         assert_eq!(inner.current_unit, "");
         let _ = fs::remove_dir_all(&root);
