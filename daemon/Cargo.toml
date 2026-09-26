@@ -2,6 +2,8 @@
 name = "gnome-vram-booster"
 version = "0.7.0"
 edition = "2024"
+# let-chains, stable since 1.88
+rust-version = "1.88"
 authors = ["sachesi <xsachesi@pm.me>"]
 description = "GNOME daemon for dynamic VRAM prioritization via dmem cgroups"
 license = "GPL-3.0-or-later"
