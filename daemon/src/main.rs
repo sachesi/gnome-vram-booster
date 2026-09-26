@@ -853,7 +853,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     guard.reset_previous().await;
     guard.restore_slices().await;
     info!("cleanup done, exiting");
-    Ok(())
+    // With the lock still held: returning would release it before the
+    // runtime stops, and a FocusChanged call waiting on it could boost again.
+    std::process::exit(0);
 }
 
 /// A FIFO as `dmem.low`: every write to it blocks until it is read, which
