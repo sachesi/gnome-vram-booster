@@ -1,9 +1,24 @@
 use std::collections::HashMap;
 use std::fs;
+use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 use zbus::{connection, interface};
+
+/// Trim a string that came from another process (a cgroup name, a `comm`)
+/// before it goes into a log line: control characters would let any user
+/// forge journal entries of this root daemon, and an overlong name would bury
+/// the rest of the line. The cap is 255, the longest a unit or cgroup name
+/// can be, so those are never cut.
+fn loggable(raw: &str) -> String {
+    let clean: String = raw.chars().filter(|c| !c.is_control()).collect();
+    match clean.char_indices().nth(255) {
+        Some((i, _)) => format!("{}\u{2026}", &clean[..i]),
+        None => clean,
+    }
+}
 
 fn parse_dmem_capacity(content: &str) -> Vec<(String, u64)> {
     content
@@ -57,63 +72,109 @@ enum WriteOutcome {
     TimedOut,
 }
 
-async fn write_dmem_low(
-    cgroup_dir: &str,
-    drm_key: &str,
-    bytes: u64,
-) -> std::io::Result<WriteOutcome> {
-    if cgroup_dir.contains("..") {
-        return Ok(WriteOutcome::Missing);
-    }
-    let file = format!("{cgroup_dir}/dmem.low");
-    let drm_key = drm_key.to_string();
-    match tokio::time::timeout(std::time::Duration::from_secs(2), async move {
-        if tokio::fs::metadata(&file).await.is_err() {
-            return Ok::<WriteOutcome, std::io::Error>(WriteOutcome::Missing);
-        }
-        tokio::fs::write(&file, format!("{drm_key} {bytes}\n")).await?;
-        Ok(WriteOutcome::Wrote)
-    })
-    .await
-    {
-        Ok(result) => result,
-        Err(_) => Ok(WriteOutcome::TimedOut),
-    }
+/// One dmem write, carried out on the writer thread.
+struct Job {
+    file: String,
+    body: String,
+    /// Open with O_NONBLOCK. For `dmem.max` that stops a kernel which
+    /// reclaims down to a lowered limit (7.3 and later) from evicting in the
+    /// write: the limit takes effect at once, and usage shrinks as buffers
+    /// are freed. Older kernels ignore the flag.
+    nonblock: bool,
+    done: tokio::sync::oneshot::Sender<std::io::Result<WriteOutcome>>,
 }
 
-/// Set the dmem file `name` of `cgroup_dir` to `value` for `drm_key`. Opened
-/// with O_NONBLOCK, which stops a kernel that reclaims down to a lowered
-/// dmem.max (7.3 and later) from evicting in the write: the limit takes
-/// effect at once, and usage shrinks as buffers are freed. Older kernels,
-/// and dmem.low, ignore it.
-async fn write_dmem_value(
-    cgroup_dir: &str,
-    name: &str,
-    drm_key: &str,
-    value: &str,
-) -> std::io::Result<WriteOutcome> {
+fn write_file(file: &str, body: &str, nonblock: bool) -> std::io::Result<()> {
+    if !nonblock {
+        return fs::write(file, body);
+    }
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
-    if cgroup_dir.contains("..") {
-        return Ok(WriteOutcome::Missing);
+    fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(file)?
+        .write_all(body.as_bytes())
+}
+
+/// Writes dmem files on a thread of its own, one at a time and in the
+/// order they were asked for. A write that hangs holds up the ones behind it
+/// instead of being overtaken, so a clear queued after a boost can never
+/// land first and leave the boost in place. Waiting for a write is bounded;
+/// the write itself is not, since a blocking write cannot be cancelled.
+struct DmemWriter {
+    jobs: std::sync::mpsc::Sender<Job>,
+    timeout: Duration,
+}
+
+impl DmemWriter {
+    fn new(timeout: Duration) -> Self {
+        let (jobs, queue) = std::sync::mpsc::channel::<Job>();
+        std::thread::spawn(move || {
+            for job in queue {
+                let outcome = if fs::metadata(&job.file).is_err() {
+                    Ok(WriteOutcome::Missing)
+                } else {
+                    write_file(&job.file, &job.body, job.nonblock).map(|()| WriteOutcome::Wrote)
+                };
+                let _ = job.done.send(outcome);
+            }
+        });
+        Self { jobs, timeout }
     }
-    let file = format!("{cgroup_dir}/{name}");
-    let body = format!("{drm_key} {value}\n");
-    let write = tokio::task::spawn_blocking(move || {
-        if fs::metadata(&file).is_err() {
+
+    /// Set `dmem.low` of `cgroup_dir` for `drm_key`.
+    async fn write(
+        &self,
+        cgroup_dir: &str,
+        drm_key: &str,
+        bytes: u64,
+    ) -> std::io::Result<WriteOutcome> {
+        self.queue(
+            cgroup_dir,
+            "dmem.low",
+            format!("{drm_key} {bytes}\n"),
+            false,
+        )
+        .await
+    }
+
+    /// Set the dmem file `name` of `cgroup_dir` to `value` for `drm_key`.
+    async fn write_value(
+        &self,
+        cgroup_dir: &str,
+        name: &str,
+        drm_key: &str,
+        value: &str,
+    ) -> std::io::Result<WriteOutcome> {
+        self.queue(cgroup_dir, name, format!("{drm_key} {value}\n"), true)
+            .await
+    }
+
+    async fn queue(
+        &self,
+        cgroup_dir: &str,
+        name: &str,
+        body: String,
+        nonblock: bool,
+    ) -> std::io::Result<WriteOutcome> {
+        if cgroup_dir.contains("..") {
             return Ok(WriteOutcome::Missing);
         }
-        fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(&file)?
-            .write_all(body.as_bytes())?;
-        Ok(WriteOutcome::Wrote)
-    });
-    match tokio::time::timeout(std::time::Duration::from_secs(2), write).await {
-        Ok(result) => result.map_err(std::io::Error::other)?,
-        Err(_) => Ok(WriteOutcome::TimedOut),
+        let gone = || std::io::Error::other("the dmem writer thread is gone");
+        let (done, outcome) = tokio::sync::oneshot::channel();
+        let job = Job {
+            file: format!("{cgroup_dir}/{name}"),
+            body,
+            nonblock,
+            done,
+        };
+        self.jobs.send(job).map_err(|_| gone())?;
+        match tokio::time::timeout(self.timeout, outcome).await {
+            Ok(result) => result.map_err(|_| gone())?,
+            Err(_) => Ok(WriteOutcome::TimedOut),
+        }
     }
 }
 
@@ -170,11 +231,29 @@ fn dmem_low_has_value(content: &str, drm_key: &str, value: u64) -> bool {
     })
 }
 
+/// The unit a cgroup under `app.slice` belongs to: the first component below
+/// it, through any sub-slices, that is not itself a slice. A process can sit
+/// deeper, in a cgroup a delegated unit made for itself; a child's protection
+/// is bounded by its parent's, so the unit is what gets boosted. None outside
+/// `app.slice`, or in a slice.
+fn app_unit_cgroup(cgroup_dir: &str) -> Option<String> {
+    let (head, rest) = cgroup_dir.split_once("/app.slice/")?;
+    let mut unit = format!("{head}/app.slice");
+    for part in rest.split('/') {
+        unit.push('/');
+        unit.push_str(part);
+        if !part.ends_with(".slice") {
+            return Some(unit);
+        }
+    }
+    None
+}
+
 /// Best-effort startup cleanup: clear dmem.low values left behind by a crashed
 /// or SIGKILLed daemon. Only clears app.slice scopes whose value for the selected
 /// drm_key equals our boost value; unrelated values are left untouched.
-fn cleanup_stale_boosts(drm_key: &str, boost_bytes: u64) -> usize {
-    fn walk(dir: &std::path::Path, drm_key: &str, boost_bytes: u64, cleared: &mut usize) {
+fn cleanup_stale_boosts(root: &Path, drm_key: &str, boost_bytes: u64) -> usize {
+    fn walk(dir: &Path, drm_key: &str, boost_bytes: u64, cleared: &mut usize) {
         let entries = match fs::read_dir(dir) {
             Ok(e) => e,
             Err(_) => return,
@@ -195,19 +274,17 @@ fn cleanup_stale_boosts(drm_key: &str, boost_bytes: u64) -> usize {
                 if dmem_low_has_value(&content, drm_key, boost_bytes) {
                     match fs::write(&path, format!("{drm_key} 0\n")) {
                         Ok(()) => *cleared += 1,
-                        Err(e) => warn!("startup cleanup: failed to clear {}: {e}", path.display()),
+                        Err(e) => warn!(
+                            "startup cleanup: failed to clear {}: {e}",
+                            loggable(&path.to_string_lossy())
+                        ),
                     }
                 }
             }
         }
     }
     let mut cleared = 0;
-    walk(
-        std::path::Path::new("/sys/fs/cgroup/user.slice"),
-        drm_key,
-        boost_bytes,
-        &mut cleared,
-    );
+    walk(root, drm_key, boost_bytes, &mut cleared);
     cleared
 }
 
@@ -223,11 +300,22 @@ fn pid_comm(pid: u32) -> String {
     read_trimmed(&format!("/proc/{pid}/comm")).unwrap_or_default()
 }
 
-fn find_app_scope_for_pid(pid: u32, max_depth: usize) -> Option<String> {
-    fn check(pid: u32, depth: usize, max_depth: usize) -> Option<String> {
-        if let Some(cg) = cgroup_path_for_pid(pid)
-            && is_app_scope(&cg)
-        {
+/// The app.slice unit cgroup of `pid`, or of one of its descendants up to
+/// `max_depth`. Launchers commonly sit outside `app.slice` and put the app
+/// they started into a scope of its own.
+///
+/// The search is bounded three ways: by depth, by `MAX_CHILDREN` per level,
+/// and by `deadline` - a supervisor with hundreds of children would otherwise
+/// turn one focus event into thousands of `/proc` reads, which the caller's
+/// timeout cannot stop once they started.
+fn find_app_scope_for_pid(pid: u32, max_depth: usize, deadline: Instant) -> Option<String> {
+    const MAX_CHILDREN: usize = 64;
+
+    fn check(pid: u32, depth: usize, max_depth: usize, deadline: Instant) -> Option<String> {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        if let Some(cg) = cgroup_path_for_pid(pid).and_then(|c| app_unit_cgroup(&c)) {
             return Some(cg);
         }
         if depth >= max_depth {
@@ -235,6 +323,7 @@ fn find_app_scope_for_pid(pid: u32, max_depth: usize) -> Option<String> {
         }
         let task_dir = format!("/proc/{pid}/task");
         let task_entries = fs::read_dir(&task_dir).ok()?;
+        let mut visited = 0;
         for entry in task_entries.flatten() {
             let tid: u32 = match entry.file_name().to_string_lossy().parse() {
                 Ok(t) => t,
@@ -249,14 +338,18 @@ fn find_app_scope_for_pid(pid: u32, max_depth: usize) -> Option<String> {
                     Ok(c) => c,
                     Err(_) => continue,
                 };
-                if let Some(cg) = check(child, depth + 1, max_depth) {
+                if let Some(cg) = check(child, depth + 1, max_depth, deadline) {
                     return Some(cg);
+                }
+                visited += 1;
+                if visited >= MAX_CHILDREN {
+                    return None;
                 }
             }
         }
         None
     }
-    check(pid, 0, max_depth)
+    check(pid, 0, max_depth, deadline)
 }
 
 fn parse_boost_ratio(raw: &str) -> Option<f64> {
@@ -369,6 +462,9 @@ fn read_boost_ratio() -> f64 {
 
 struct Inner {
     prev_cgroup: Option<String>,
+    /// Cgroup whose boost write did not finish in time. It is not reported as
+    /// boosted, but the write can still land, so the next clear covers it too.
+    unconfirmed: Option<String>,
     current_unit: String,
     drm_key: String,
     vram_total: u64,
@@ -378,6 +474,7 @@ struct Inner {
     /// Each slice seen so far, by its directory and the setting's index in
     /// `slices`, with the setting's state there.
     slice_states: HashMap<(String, usize), SliceState>,
+    writer: DmemWriter,
 }
 
 impl Inner {
@@ -403,7 +500,11 @@ impl Inner {
                 None => SliceState::Unknown,
                 Some(v) if v == ours => SliceState::Held,
                 Some(v) if v == setting.unset => {
-                    match write_dmem_value(&dir, setting.file, &self.drm_key, &ours).await {
+                    match self
+                        .writer
+                        .write_value(&dir, setting.file, &self.drm_key, &ours)
+                        .await
+                    {
                         Ok(WriteOutcome::Wrote) => {
                             let now = dmem_value_of(&dir, setting.file, &self.drm_key).await;
                             if now.as_deref() == Some(ours.as_str()) {
@@ -415,7 +516,7 @@ impl Inner {
                         Ok(_) => SliceState::Unknown,
                         Err(e) => {
                             if before != SliceState::Failed {
-                                warn!("cannot set {} in {dir}: {e}", setting.what);
+                                warn!("cannot set {} in {}: {e}", setting.what, loggable(&dir));
                             }
                             SliceState::Failed
                         }
@@ -424,8 +525,11 @@ impl Inner {
                 Some(v) => {
                     if before != SliceState::Foreign {
                         warn!(
-                            "{dir}/{} is {v} for {}, not this daemon's; leaving it alone",
-                            setting.file, self.drm_key
+                            "{}/{} is {} for {}, not this daemon's; leaving it alone",
+                            loggable(&dir),
+                            setting.file,
+                            loggable(v),
+                            self.drm_key
                         );
                     }
                     SliceState::Foreign
@@ -434,12 +538,17 @@ impl Inner {
             if state != before {
                 match state {
                     SliceState::Held => info!(
-                        "set {} in {dir}: {}={}",
-                        setting.what, setting.file, setting.value
+                        "set {} in {}: {}={}",
+                        setting.what,
+                        loggable(&dir),
+                        setting.file,
+                        setting.value
                     ),
                     SliceState::Refused => info!(
-                        "the kernel kept {dir}/{} as it was, since the slice uses more than {} bytes; trying again at the next focus change",
-                        setting.file, setting.value
+                        "the kernel kept {}/{} as it was, since the slice uses more than {} bytes; trying again at the next focus change",
+                        loggable(&dir),
+                        setting.file,
+                        setting.value
                     ),
                     _ => {}
                 }
@@ -456,13 +565,21 @@ impl Inner {
             if current != Some(setting.value.to_string()) {
                 continue;
             }
-            match write_dmem_value(&dir, setting.file, &self.drm_key, setting.unset).await {
-                Ok(WriteOutcome::Wrote) => info!("took off {} in {dir}", setting.what),
+            let dir_label = loggable(&dir);
+            match self
+                .writer
+                .write_value(&dir, setting.file, &self.drm_key, setting.unset)
+                .await
+            {
+                Ok(WriteOutcome::Wrote) => info!("took off {} in {dir_label}", setting.what),
                 Ok(WriteOutcome::Missing) => {}
                 Ok(WriteOutcome::TimedOut) => {
-                    warn!("taking off {} in {dir} did not finish in 2 s", setting.what)
+                    warn!(
+                        "taking off {} in {dir_label} did not finish in 2 s",
+                        setting.what
+                    )
                 }
-                Err(e) => warn!("cannot take off {} in {dir}: {e}", setting.what),
+                Err(e) => warn!("cannot take off {} in {dir_label}: {e}", setting.what),
             }
         }
     }
@@ -476,23 +593,20 @@ impl Inner {
     }
 
     async fn reset_previous(&mut self) {
-        if let Some(ref prev) = self.prev_cgroup {
-            match write_dmem_low(prev, &self.drm_key, 0).await {
-                Ok(WriteOutcome::Wrote) => info!("dmem.low=0 \u{2190} {}", unit_label(prev)),
+        let targets = self.prev_cgroup.take().into_iter();
+        for prev in targets.chain(self.unconfirmed.take()) {
+            let label = loggable(unit_label(&prev));
+            match self.writer.write(&prev, &self.drm_key, 0).await {
+                Ok(WriteOutcome::Wrote) => info!("dmem.low=0 \u{2190} {label}"),
                 Ok(WriteOutcome::Missing) => {
-                    info!("dmem.low missing (scope gone?): {}", unit_label(prev));
+                    info!("dmem.low missing (scope gone?): {label}");
                 }
-                Ok(WriteOutcome::TimedOut) => warn!(
-                    "Reverting dmem.low to 0 for {} did not finish in 2 s",
-                    unit_label(prev)
-                ),
-                Err(e) => warn!(
-                    "Failed to revert dmem.low to 0 for {}: {e}",
-                    unit_label(prev)
-                ),
+                Ok(WriteOutcome::TimedOut) => {
+                    warn!("Reverting dmem.low to 0 for {label} did not finish in 2 s")
+                }
+                Err(e) => warn!("Failed to revert dmem.low to 0 for {label}: {e}"),
             }
         }
-        self.prev_cgroup = None;
         self.current_unit.clear();
     }
 
@@ -500,7 +614,7 @@ impl Inner {
         let cgroup = match cgroup {
             Some(p) => p,
             None => {
-                info!("pid={pid} skip (no app.slice in cgroup tree); clearing previous boost");
+                info!("pid={pid} skip (no app.slice unit); clearing previous boost");
                 self.reset_previous().await;
                 return false;
             }
@@ -510,8 +624,15 @@ impl Inner {
             self.ensure_slices(&manager).await;
         }
 
-        let label = unit_label(&cgroup).to_string();
+        // A cgroup name is whatever the process that made it chose, so it is
+        // cleaned for the log; ctl cleans what it prints of current_unit.
+        let label = loggable(unit_label(&cgroup));
         let boost = self.boost_bytes();
+        // A timed-out write to this very cgroup needs no clear: it is about
+        // to be written again, behind that write.
+        if self.unconfirmed.as_deref() == Some(cgroup.as_str()) {
+            self.unconfirmed = None;
+        }
 
         // Same cgroup as last time. Trusting in-memory state would hide a boost
         // that something else reverted, so the file decides.
@@ -524,17 +645,18 @@ impl Inner {
         let comm = tokio::task::spawn_blocking(move || pid_comm(pid))
             .await
             .unwrap_or_default();
-        info!("focus pid={pid} ({comm}) \u{2192} dmem.low={boost} \u{2192} {label}");
+        info!(
+            "focus pid={pid} ({}) \u{2192} dmem.low={boost} \u{2192} {label}",
+            loggable(&comm)
+        );
 
         if self.prev_cgroup.as_deref() != Some(cgroup.as_str()) {
             self.reset_previous().await;
         }
 
-        match write_dmem_low(&cgroup, &self.drm_key, boost).await {
+        let boosted = match self.writer.write(&cgroup, &self.drm_key, boost).await {
             Ok(WriteOutcome::Wrote) => {
                 info!("dmem.low={boost} \u{2192} {label}");
-                self.prev_cgroup = Some(cgroup);
-                self.current_unit = label;
                 true
             }
             Ok(WriteOutcome::Missing) => {
@@ -543,13 +665,19 @@ impl Inner {
             }
             Ok(WriteOutcome::TimedOut) => {
                 warn!("Failed to boost {label}: the write to dmem.low did not finish in 2 s");
+                self.unconfirmed = Some(cgroup.clone());
                 false
             }
             Err(e) => {
                 warn!("Failed to write dmem.low boost for {label}: {e}");
                 false
             }
+        };
+        if boosted {
+            self.current_unit = unit_label(&cgroup).to_string();
+            self.prev_cgroup = Some(cgroup);
         }
+        boosted
     }
 }
 
@@ -560,9 +688,14 @@ struct VramBoosterService {
 #[interface(name = "org.gnome.VramBooster")]
 impl VramBoosterService {
     async fn focus_changed(&self, pid: u32) -> bool {
+        // The lookup reads /proc on the blocking pool, where a timeout cannot
+        // cancel it. The deadline inside is what stops it; the outer timeout
+        // only covers the handoff.
+        const BUDGET: Duration = Duration::from_millis(500);
+        let deadline = Instant::now() + BUDGET;
         let cgroup = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            tokio::task::spawn_blocking(move || find_app_scope_for_pid(pid, 3)),
+            BUDGET + Duration::from_millis(100),
+            tokio::task::spawn_blocking(move || find_app_scope_for_pid(pid, 3, deadline)),
         )
         .await
         .ok()
@@ -666,12 +799,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cleanup_key = drm_key.clone();
     let inner = Arc::new(Mutex::new(Inner {
         prev_cgroup: None,
+        unconfirmed: None,
         current_unit: String::new(),
         drm_key,
         vram_total,
         boost_ratio,
         slices,
         slice_states: HashMap::new(),
+        writer: DmemWriter::new(Duration::from_secs(2)),
     }));
 
     let _conn = connection::Builder::system()?
@@ -687,7 +822,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // After the bus name, never before: a second instance has to fail claiming
     // it while the running one still owns the boost it applied.
-    let cleared = cleanup_stale_boosts(&cleanup_key, boost_bytes);
+    let cleared = cleanup_stale_boosts(
+        Path::new("/sys/fs/cgroup/user.slice"),
+        &cleanup_key,
+        boost_bytes,
+    );
     info!("startup cleanup: cleared {cleared} stale dmem.low boost value(s)");
 
     info!("gnome-vram-booster ready on system bus (org.gnome.VramBooster)");
@@ -708,9 +847,65 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// A FIFO as `dmem.low`: every write to it blocks until it is read, which
+/// makes a hung write on demand.
+#[cfg(test)]
+mod fifo {
+    use std::io::Read;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+
+    pub(crate) fn make(dir: &Path) -> PathBuf {
+        let fifo = dir.join("dmem.low");
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+        assert!(made.unwrap().success());
+        fifo
+    }
+
+    /// Read `lines` lines from the FIFO on a thread of its own, through one
+    /// descriptor. Reopening it per write would race the next write: one that
+    /// opens just before the reader closes lands in a pipe nobody reads, and
+    /// the reader waits for it forever.
+    pub(crate) fn read_lines(
+        fifo: PathBuf,
+        lines: usize,
+    ) -> tokio::sync::oneshot::Receiver<String> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let mut file = std::fs::File::open(&fifo).unwrap();
+            let mut seen = String::new();
+            let mut buf = [0u8; 256];
+            while seen.lines().count() < lines {
+                match file.read(&mut buf).unwrap() {
+                    // no writer at the moment; the next one does not wait,
+                    // since this descriptor keeps a reader on the FIFO
+                    0 => std::thread::sleep(Duration::from_millis(1)),
+                    n => seen.push_str(std::str::from_utf8(&buf[..n]).unwrap()),
+                }
+            }
+            let _ = tx.send(seen);
+        });
+        rx
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn inner_with(key: &str, slices: Vec<SliceSetting>, write_timeout: Duration) -> Inner {
+        Inner {
+            prev_cgroup: None,
+            unconfirmed: None,
+            current_unit: String::new(),
+            drm_key: key.to_string(),
+            vram_total: 1000,
+            boost_ratio: 0.9,
+            slices,
+            slice_states: HashMap::new(),
+            writer: DmemWriter::new(write_timeout),
+        }
+    }
 
     #[test]
     fn parse_dmem_capacity_picks_drm_entries() {
@@ -783,18 +978,14 @@ mod tests {
         let manager = std::env::temp_dir().join(format!("gvb-slices-{}", std::process::id()));
         let _ = fs::remove_dir_all(&manager);
         let key = "drm/0000:2d:00.0/vram";
-        let mut inner = Inner {
-            prev_cgroup: None,
-            current_unit: String::new(),
-            drm_key: key.to_string(),
-            vram_total: 1000,
-            boost_ratio: 0.9,
-            slices: vec![
+        let mut inner = inner_with(
+            key,
+            vec![
                 SliceSetting::session_protection(1000),
                 SliceSetting::ceiling(900),
             ],
-            slice_states: HashMap::new(),
-        };
+            Duration::from_secs(2),
+        );
         let files = [
             (manager.join("session.slice/dmem.low"), "0", "1000"),
             (manager.join("app.slice/dmem.max"), "max", "900"),
@@ -853,5 +1044,88 @@ mod tests {
         assert!(!dmem_low_has_value(body, "drm/0000:2d:00.0/vram", 0));
         assert!(!dmem_low_has_value(body, "drm/other/vram", 7715841638));
         assert!(!dmem_low_has_value("", "drm/0000:2d:00.0/vram", 7715841638));
+    }
+
+    #[test]
+    fn app_unit_cgroup_stops_at_the_unit() {
+        let app = "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice";
+        let unit = format!("{app}/app-foo.scope");
+        assert_eq!(app_unit_cgroup(&unit), Some(unit.clone()));
+        // a cgroup a delegated unit made for itself resolves to the unit
+        assert_eq!(
+            app_unit_cgroup(&format!("{unit}/container/payload")),
+            Some(unit)
+        );
+        let dbus = format!(
+            "{app}/app-dbus\\x2d:1.2\\x2dorg.gnome.Loupe.slice/dbus-:1.2-org.gnome.Loupe@0.service"
+        );
+        assert_eq!(app_unit_cgroup(&dbus), Some(dbus.clone()));
+        // a slice is never the unit, nor is anything outside app.slice
+        assert_eq!(app_unit_cgroup(&format!("{app}/app-x.slice")), None);
+        assert_eq!(app_unit_cgroup(app), None);
+        assert_eq!(
+            app_unit_cgroup("/sys/fs/cgroup/user.slice/user-1000.slice/session-2.scope"),
+            None
+        );
+    }
+
+    /// A FIFO as `dmem.low` blocks a write until someone reads it, which is a
+    /// hung write on demand: the one behind it must wait, not overtake it.
+    #[tokio::test]
+    async fn a_hung_write_is_not_overtaken_by_the_next() {
+        let dir = std::env::temp_dir().join(format!("gvb-fifo-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let fifo = fifo::make(&dir);
+        let path = dir.to_string_lossy().into_owned();
+        let key = "drm/0000:2d:00.0/vram";
+        let writer = DmemWriter::new(Duration::from_millis(100));
+
+        // nobody reads the FIFO: the boost hangs, and waiting for it gives up
+        assert_eq!(
+            writer.write(&path, key, 7715841638).await.unwrap(),
+            WriteOutcome::TimedOut
+        );
+        // the clear is queued behind it before anything reads the FIFO
+        let clear = writer.write(&path, key, 0);
+        // started only once the clear is queued; a plain thread, so a read
+        // that never ends fails on the timeout instead of hanging the test
+        let read = async move {
+            tokio::time::timeout(Duration::from_secs(5), fifo::read_lines(fifo, 2)).await
+        };
+        let (_, seen) = tokio::join!(clear, read);
+        let seen = seen.expect("the FIFO never saw both writes").unwrap();
+        assert_eq!(seen, format!("{key} 7715841638\n{key} 0\n"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A boost whose write hangs is not reported, and the next clear still
+    /// goes to it, queued behind the hung write.
+    #[tokio::test]
+    async fn a_timed_out_boost_is_not_reported_but_still_cleared() {
+        let dir = std::env::temp_dir().join(format!("gvb-inner-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let fifo = fifo::make(&dir);
+        let key = "drm/0000:2d:00.0/vram";
+        let mut inner = inner_with(key, Vec::new(), Duration::from_millis(100));
+        let cgroup = dir.to_string_lossy().into_owned();
+
+        let boosted = inner
+            .handle_focus(Some(cgroup.clone()), std::process::id())
+            .await;
+        assert!(!boosted);
+        assert_eq!(inner.prev_cgroup, None);
+        assert_eq!(inner.current_unit, "");
+        assert_eq!(inner.unconfirmed.as_deref(), Some(cgroup.as_str()));
+
+        inner.reset_previous().await;
+        assert_eq!(inner.unconfirmed, None);
+        let seen = tokio::time::timeout(Duration::from_secs(5), fifo::read_lines(fifo, 2))
+            .await
+            .expect("the FIFO never saw both writes")
+            .unwrap();
+        assert_eq!(seen, format!("{key} 900\n{key} 0\n"));
+        let _ = fs::remove_dir_all(&dir);
     }
 }
