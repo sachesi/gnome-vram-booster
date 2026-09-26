@@ -96,6 +96,7 @@ export default class VramBoosterExtension extends Extension {
         this._debounceId = null;
         this._lastPid = 0;
         this._proxy = null;
+        this._proxyCancellable = null;
         this._daemonWatchId = 0;
         this._indicator = null;
         this._indicatorLabel = null;
@@ -116,6 +117,8 @@ export default class VramBoosterExtension extends Extension {
             () => this._onDaemonAppeared(),
             () => {
                 // Daemon vanished: drop the proxy and reset local state to offline.
+                this._proxyCancellable?.cancel();
+                this._proxyCancellable = null;
                 this._proxy = null;
                 this._daemonOnline = false;
                 this._lastPid = 0;
@@ -144,6 +147,8 @@ export default class VramBoosterExtension extends Extension {
             Gio.DBus.system.unwatch_name(this._daemonWatchId);
             this._daemonWatchId = 0;
         }
+        this._proxyCancellable?.cancel();
+        this._proxyCancellable = null;
         if (this._settingsSig) {
             this._settings.disconnect(this._settingsSig);
             this._settingsSig = null;
@@ -163,24 +168,34 @@ export default class VramBoosterExtension extends Extension {
         this._lastPid = 0;
     }
 
+    // The proxy is set up asynchronously: a synchronous one would block the
+    // Shell's main loop on a round trip to the daemon.
     _onDaemonAppeared() {
-        this._daemonOnline = true;
+        this._proxyCancellable?.cancel();
+        const cancellable = new Gio.Cancellable();
+        this._proxyCancellable = cancellable;
         const VramBoosterProxy = Gio.DBusProxy.makeProxyWrapper(VRAM_BOOSTER_IFACE);
-        try {
-            this._proxy = new VramBoosterProxy(
-                Gio.DBus.system,
-                'org.gnome.VramBooster',
-                '/org/gnome/VramBooster',
-                null
-            );
-            this._lastPid = 0;
-            this._idle = true;
-            this._onFocusChanged();
-        } catch (e) {
-            console.error('[vram-booster] Failed to connect to daemon D-Bus interface:', e.message);
-            this._proxy = null;
-            this._daemonOnline = false;
-        }
+        VramBoosterProxy(
+            Gio.DBus.system,
+            'org.gnome.VramBooster',
+            '/org/gnome/VramBooster',
+            (proxy, error) => {
+                if (cancellable.is_cancelled())
+                    return;
+                this._proxyCancellable = null;
+                if (error) {
+                    console.error('[vram-booster] Failed to connect to daemon D-Bus interface:', error.message);
+                    return;
+                }
+                this._proxy = proxy;
+                this._daemonOnline = true;
+                this._lastPid = 0;
+                this._idle = true;
+                this._onFocusChanged();
+            },
+            cancellable,
+            Gio.DBusProxyFlags.DO_NOT_LOAD_PROPERTIES | Gio.DBusProxyFlags.DO_NOT_CONNECT_SIGNALS
+        );
     }
 
     // Tell the daemon to drop any active boost and go idle. Cached so we do not
