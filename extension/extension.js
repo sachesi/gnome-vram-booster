@@ -97,6 +97,7 @@ export default class VramBoosterExtension extends Extension {
         this._lastPid = 0;
         this._proxy = null;
         this._proxyCancellable = null;
+        this._request = 0;
         this._daemonWatchId = 0;
         this._indicator = null;
         this._indicatorLabel = null;
@@ -207,6 +208,9 @@ export default class VramBoosterExtension extends Extension {
         }
         this._idle = true;
         this._lastPid = 0;
+        // so that a FocusChanged reply still on its way, which answers for a
+        // focus that is gone, cannot mark us boosted again
+        this._request++;
         this._updateIndicatorText(null);
         if (!this._proxy)
             return;
@@ -267,8 +271,14 @@ export default class VramBoosterExtension extends Extension {
                 return GLib.SOURCE_REMOVE;
             this._lastPid = pid;
             if (this._proxy) {
+                // Until the reply, a boost may be on its way, so a focus change
+                // meanwhile has to send ClearFocus rather than take us for idle.
+                this._idle = false;
+                const request = ++this._request;
                 try {
                     this._proxy.FocusChangedRemote(pid, (result, error) => {
+                        if (request !== this._request)
+                            return;
                         if (error) {
                             console.error(`[vram-booster] Failed to notify daemon of focus change for PID ${pid}:`, error.message);
                             return;
