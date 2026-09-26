@@ -718,44 +718,44 @@ impl VramBoosterService {
         true
     }
 
-    #[zbus(property)]
+    #[zbus(property(emits_changed_signal = "false"))]
     async fn current_unit(&self) -> String {
         self.inner.lock().await.current_unit.clone()
     }
 
-    #[zbus(property)]
+    #[zbus(property(emits_changed_signal = "const"))]
     async fn drm_key(&self) -> String {
         self.inner.lock().await.drm_key.clone()
     }
 
-    #[zbus(property)]
+    #[zbus(property(emits_changed_signal = "const"))]
     async fn vram_total(&self) -> u64 {
         self.inner.lock().await.vram_total
     }
 
-    #[zbus(property)]
+    #[zbus(property(emits_changed_signal = "const"))]
     async fn boost_ratio(&self) -> f64 {
         self.inner.lock().await.boost_ratio
     }
 
-    #[zbus(property)]
+    #[zbus(property(emits_changed_signal = "const"))]
     async fn boosted_bytes(&self) -> u64 {
         self.inner.lock().await.boost_bytes()
     }
 
     /// dmem.max this daemon puts on each user's app.slice; 0 when off.
-    #[zbus(property)]
+    #[zbus(property(emits_changed_signal = "const"))]
     async fn app_slice_ceiling(&self) -> u64 {
         self.inner.lock().await.slice_value("dmem.max")
     }
 
     /// dmem.low the daemon puts on each user's session.slice; 0 when none.
-    #[zbus(property)]
+    #[zbus(property(emits_changed_signal = "const"))]
     async fn session_slice_low(&self) -> u64 {
         self.inner.lock().await.slice_value("dmem.low")
     }
 
-    #[zbus(property)]
+    #[zbus(property(emits_changed_signal = "false"))]
     async fn prev_cgroup(&self) -> String {
         self.inner
             .lock()
