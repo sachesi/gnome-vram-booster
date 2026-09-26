@@ -8,9 +8,12 @@ Type=dbus
 BusName=org.gnome.VramBooster
 ExecStart=/usr/bin/gnome-vram-booster
 Environment=RUST_LOG=warn
-# VRAM_BOOST_RATIO=0.90  # uncomment to override (0.0–1.0)
-# VRAM_PROTECT_SESSION=0 # leave session.slice's dmem.low alone
-# VRAM_RESERVE_MIB=256   # cap app.slice this far below VRAM (off by default)
+# Overrides, best set with `systemctl edit`: the share of VRAM to boost
+# (0.0–1.0), 0 to leave session.slice's dmem.low alone, and how far below the
+# VRAM to cap app.slice (off by default).
+# Environment=VRAM_BOOST_RATIO=0.90
+# Environment=VRAM_PROTECT_SESSION=0
+# Environment=VRAM_RESERVE_MIB=256
 Restart=on-failure
 RestartSec=3
 
