@@ -37,21 +37,40 @@ fn parse_dmem_capacity(content: &str) -> Vec<(String, u64)> {
         .collect()
 }
 
-fn read_dmem_capacity() -> Option<(String, u64)> {
-    let content = fs::read_to_string("/sys/fs/cgroup/dmem.capacity").ok()?;
-    let entries: Vec<(String, u64)> = parse_dmem_capacity(&content);
-
-    if let Ok(override_key) = std::env::var("DRM_KEY") {
-        return entries
-            .into_iter()
-            .find(|(k, _)| *k == override_key)
-            .or_else(|| {
-                warn!("DRM_KEY={override_key} not found in dmem.capacity");
-                None
-            });
+/// The GPU to boost: the largest drm entry in `dmem.capacity`, or the one
+/// `DRM_KEY` names. The error is the message to show the user, since every
+/// failure here has a different cause and a different fix.
+fn read_dmem_capacity() -> Result<(String, u64), String> {
+    let content = fs::read_to_string("/sys/fs/cgroup/dmem.capacity").map_err(|e| {
+        format!(
+            "cannot read /sys/fs/cgroup/dmem.capacity: {e}. Does this kernel have the dmem controller (6.14+, 6.15+ for amdgpu)?"
+        )
+    })?;
+    let entries = parse_dmem_capacity(&content);
+    if entries.is_empty() {
+        return Err(
+            "no drm entries in /sys/fs/cgroup/dmem.capacity. Is dmemcg-booster.service running?"
+                .to_string(),
+        );
     }
-
-    entries.into_iter().max_by_key(|(_, v)| *v)
+    match std::env::var("DRM_KEY") {
+        Ok(wanted) => entries
+            .iter()
+            .find(|(k, _)| *k == wanted)
+            .cloned()
+            .ok_or_else(|| {
+                let known: Vec<&str> = entries.iter().map(|(k, _)| k.as_str()).collect();
+                format!(
+                    "DRM_KEY={} is not in dmem.capacity, which lists: {}",
+                    loggable(&wanted),
+                    known.join(", ")
+                )
+            }),
+        Err(_) => entries
+            .into_iter()
+            .max_by_key(|(_, v)| *v)
+            .ok_or_else(|| "no usable drm entry in dmem.capacity".to_string()),
+    }
 }
 
 fn cgroup_path_for_pid(pid: u32) -> Option<String> {
@@ -373,47 +392,78 @@ fn find_app_scope_for_pid(pid: u32, max_depth: usize, deadline: Instant) -> Opti
     check(pid, 0, max_depth, deadline)
 }
 
+/// Zero is refused: it would boost nothing, and startup cleanup, which looks
+/// for this daemon's own value, would take every unboosted unit for a stale boost.
 fn parse_boost_ratio(raw: &str) -> Option<f64> {
     match raw.parse::<f64>() {
-        Ok(r) if (0.0..=1.0).contains(&r) => Some(r),
+        Ok(r) if r > 0.0 && r <= 1.0 => Some(r),
         _ => None,
     }
 }
 
-/// Off unless asked for: from Linux 7.3 a charge that fails on the ceiling
-/// sends the focused app's new buffers to system memory rather than evicting
-/// background apps, see docs/usage.md.
-fn read_reserve_mib() -> u64 {
+/// An invalid ratio is an error rather than a fallback: the unit then fails
+/// with the reason in its log, where a quiet 0.90 would hide the typo.
+fn read_boost_ratio() -> Result<f64, String> {
+    let invalid = |v: &str| {
+        format!(
+            "VRAM_BOOST_RATIO={} is not a number above 0 and at most 1",
+            loggable(v)
+        )
+    };
+    match std::env::var("VRAM_BOOST_RATIO") {
+        Ok(v) => parse_boost_ratio(&v).ok_or_else(|| invalid(&v)),
+        Err(std::env::VarError::NotPresent) => Ok(0.90),
+        Err(std::env::VarError::NotUnicode(v)) => Err(invalid(&v.to_string_lossy())),
+    }
+}
+
+fn read_reserve_mib() -> Result<u64, String> {
+    let invalid = |v: &str| {
+        format!(
+            "VRAM_RESERVE_MIB={} is not a whole number of MiB",
+            loggable(v)
+        )
+    };
     match std::env::var("VRAM_RESERVE_MIB") {
-        Ok(v) => v.parse().unwrap_or_else(|_| {
-            warn!("VRAM_RESERVE_MIB invalid, app.slice ceiling off");
-            0
-        }),
-        Err(_) => 0,
+        Ok(v) => v.parse().map_err(|_| invalid(&v)),
+        // Off unless asked for: from Linux 7.3 a charge that fails on the
+        // ceiling sends the focused app's new buffers to system memory
+        // rather than evicting background apps, see docs/usage.md.
+        Err(std::env::VarError::NotPresent) => Ok(0),
+        Err(std::env::VarError::NotUnicode(v)) => Err(invalid(&v.to_string_lossy())),
     }
 }
 
 /// The ceiling on app.slice: VRAM less the reserve. None when the reserve is
-/// 0, which turns the ceiling off, or when nothing would be left.
-fn ceiling_for(vram_total: u64, reserve_mib: u64) -> Option<u64> {
+/// 0, which turns the ceiling off; an error when nothing would be left.
+fn ceiling_for(vram_total: u64, reserve_mib: u64) -> Result<Option<u64>, String> {
     if reserve_mib == 0 {
-        return None;
+        return Ok(None);
     }
-    reserve_mib
+    match reserve_mib
         .checked_mul(1024 * 1024)
         .and_then(|r| vram_total.checked_sub(r))
-        .filter(|c| *c > 0)
+    {
+        Some(c) if c > 0 => Ok(Some(c)),
+        _ => Err(format!(
+            "VRAM_RESERVE_MIB={reserve_mib} leaves nothing of the {} MiB of VRAM",
+            vram_total / 1024 / 1024
+        )),
+    }
 }
 
 /// Whether session.slice gets a dmem.low of the whole VRAM; on unless
 /// VRAM_PROTECT_SESSION=0.
-fn read_protect_session() -> bool {
+fn read_protect_session() -> Result<bool, String> {
     match std::env::var("VRAM_PROTECT_SESSION").as_deref() {
-        Ok("0") => false,
-        Ok("1") | Err(_) => true,
-        Ok(_) => {
-            warn!("VRAM_PROTECT_SESSION invalid, protecting session.slice");
-            true
+        Ok("1") | Err(std::env::VarError::NotPresent) => Ok(true),
+        Ok("0") => Ok(false),
+        Ok(v) => Err(format!(
+            "VRAM_PROTECT_SESSION={} is neither 0 nor 1",
+            loggable(v)
+        )),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err("VRAM_PROTECT_SESSION is neither 0 nor 1".to_string())
         }
     }
 }
@@ -468,16 +518,6 @@ impl SliceSetting {
             unset: "max",
             value,
         }
-    }
-}
-
-fn read_boost_ratio() -> f64 {
-    match std::env::var("VRAM_BOOST_RATIO") {
-        Ok(v) => parse_boost_ratio(&v).unwrap_or_else(|| {
-            warn!("VRAM_BOOST_RATIO invalid, using 0.90");
-            0.90
-        }),
-        Err(_) => 0.90,
     }
 }
 
@@ -753,12 +793,8 @@ impl VramBoosterService {
             }
             ours
         });
-        Ok(self
-            .inner
-            .lock()
-            .await
-            .handle_focus(cgroup, pid, &caller)
-            .await)
+        let mut inner = self.inner.lock().await;
+        Ok(inner.handle_focus(cgroup, pid, &caller).await)
     }
 
     /// Drop the boost, if it is the caller's.
@@ -768,7 +804,8 @@ impl VramBoosterService {
         #[zbus(header)] header: Header<'_>,
     ) -> zbus::fdo::Result<bool> {
         let caller = caller_slice(conn, &header).await?;
-        self.inner.lock().await.clear_for(&caller).await;
+        let mut inner = self.inner.lock().await;
+        inner.clear_for(&caller).await;
         Ok(true)
     }
 
@@ -858,29 +895,32 @@ fn stdout_is_journal() -> bool {
     stream.to_str() == Some(format!("{}:{}", out.dev(), out.ino()).as_str())
 }
 
+fn die(message: &str) -> ! {
+    tracing::error!("{message}");
+    std::process::exit(1);
+}
+
+/// Exit status for a setting that is wrong (EX_CONFIG). The unit does not
+/// restart on it: starting again with the same setting cannot succeed.
+const EX_CONFIG: i32 = 78;
+
+fn die_config(message: &str) -> ! {
+    tracing::error!("{message}");
+    std::process::exit(EX_CONFIG);
+}
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() {
     init_logging();
 
-    let boost_ratio = read_boost_ratio();
+    let boost_ratio = read_boost_ratio().unwrap_or_else(|e| die_config(&e));
+    let reserve_mib = read_reserve_mib().unwrap_or_else(|e| die_config(&e));
+    let protect_session = read_protect_session().unwrap_or_else(|e| die_config(&e));
     info!("boost_ratio={boost_ratio}");
 
-    let (drm_key, vram_total) = match read_dmem_capacity() {
-        Some(v) => v,
-        None => {
-            tracing::error!(
-                "No dmem capacity in /sys/fs/cgroup/dmem.capacity. Is dmemcg-booster running?"
-            );
-            std::process::exit(1);
-        }
-    };
+    let (drm_key, vram_total) = read_dmem_capacity().unwrap_or_else(|e| die(&e));
     let boost_bytes = (vram_total as f64 * boost_ratio) as u64;
-    let reserve_mib = read_reserve_mib();
-    let ceiling = ceiling_for(vram_total, reserve_mib);
-    if ceiling.is_none() && reserve_mib > 0 {
-        warn!("VRAM_RESERVE_MIB={reserve_mib} leaves nothing of the VRAM; app.slice ceiling off");
-    }
-    let protect_session = read_protect_session();
+    let ceiling = ceiling_for(vram_total, reserve_mib).unwrap_or_else(|e| die_config(&e));
     let mut slices = Vec::new();
     if protect_session {
         slices.push(SliceSetting::session_protection(vram_total));
@@ -897,35 +937,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     );
 
-    let cleanup_key = drm_key.clone();
     let inner = Arc::new(Mutex::new(Inner {
         prev_cgroup: None,
         unconfirmed: None,
         current_unit: String::new(),
-        drm_key,
+        drm_key: drm_key.clone(),
         vram_total,
         boost_ratio,
         slices,
         slice_states: HashMap::new(),
         writer: DmemWriter::new(Duration::from_secs(2)),
     }));
+    let service = VramBoosterService {
+        inner: inner.clone(),
+    };
 
-    let _conn = connection::Builder::system()?
-        .name("org.gnome.VramBooster")?
-        .serve_at(
-            "/org/gnome/VramBooster",
-            VramBoosterService {
-                inner: inner.clone(),
-            },
-        )?
-        .build()
-        .await?;
+    let conn = connection::Builder::system()
+        .and_then(|b| b.name("org.gnome.VramBooster"))
+        .and_then(|b| b.serve_at("/org/gnome/VramBooster", service));
+    let _bus = match conn {
+        Ok(builder) => match builder.build().await {
+            Ok(c) => c,
+            Err(zbus::Error::NameTaken) => {
+                die("org.gnome.VramBooster is already taken: another instance is running")
+            }
+            Err(e) => die(&format!("cannot reach the system bus: {e}")),
+        },
+        Err(e) => die(&format!("cannot set up the system bus connection: {e}")),
+    };
 
     // After the bus name, never before: a second instance has to fail claiming
     // it while the running one still owns the boost it applied.
     let cleared = cleanup_stale_boosts(
         Path::new("/sys/fs/cgroup/user.slice"),
-        &cleanup_key,
+        &drm_key,
         boost_bytes,
     );
     info!("startup cleanup: cleared {cleared} stale dmem.low boost value(s)");
@@ -933,8 +978,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("gnome-vram-booster ready on system bus (org.gnome.VramBooster)");
 
     use tokio::signal::unix::{SignalKind, signal};
-    let mut sigterm = signal(SignalKind::terminate())?;
-    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sigterm = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(e) => die(&format!("cannot listen for SIGTERM: {e}")),
+    };
+    let mut sigint = match signal(SignalKind::interrupt()) {
+        Ok(s) => s,
+        Err(e) => die(&format!("cannot listen for SIGINT: {e}")),
+    };
 
     tokio::select! {
         _ = sigterm.recv() => info!("received SIGTERM"),
@@ -1047,7 +1098,8 @@ mod tests {
     #[test]
     fn parse_boost_ratio_bounds() {
         assert_eq!(parse_boost_ratio("0.85"), Some(0.85));
-        assert_eq!(parse_boost_ratio("0"), Some(0.0));
+        assert_eq!(parse_boost_ratio("0"), None);
+        assert_eq!(parse_boost_ratio("NaN"), None);
         assert_eq!(parse_boost_ratio("1"), Some(1.0));
         assert_eq!(parse_boost_ratio("1.5"), None);
         assert_eq!(parse_boost_ratio("-0.1"), None);
@@ -1083,12 +1135,12 @@ mod tests {
     }
 
     #[test]
-    fn ceiling_for_leaves_the_reserve() {
+    fn ceiling_for_leaves_the_reserve_or_refuses() {
         let mib = 1024 * 1024;
-        assert_eq!(ceiling_for(8192 * mib, 256), Some(7936 * mib));
-        assert_eq!(ceiling_for(8192 * mib, 0), None);
-        assert_eq!(ceiling_for(256 * mib, 256), None);
-        assert_eq!(ceiling_for(8192 * mib, u64::MAX), None);
+        assert_eq!(ceiling_for(8192 * mib, 256), Ok(Some(7936 * mib)));
+        assert_eq!(ceiling_for(8192 * mib, 0), Ok(None));
+        assert!(ceiling_for(256 * mib, 256).is_err());
+        assert!(ceiling_for(8192 * mib, u64::MAX).is_err());
     }
 
     /// The slice files are ordinary files here: a setting goes where the file

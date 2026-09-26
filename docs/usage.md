@@ -49,7 +49,7 @@ Environment=VRAM_RESERVE_MIB=256
 
 It costs the focused app. A new buffer that would take `app.slice` past the ceiling goes straight to system memory (GTT) without evicting anything, even while background apps hold VRAM the focused app could otherwise take from them: from Linux 7.3 the kernel evicts for a protected allocation when VRAM itself is full, but not when a cgroup limit is hit. Only a buffer moved back into VRAM later evicts, inside `app.slice`, where the focused app's `dmem.low` still protects it. Up to 7.2 new buffers never evict, and the ceiling makes `app.slice`'s share of VRAM smaller by the reserve. Turn it on if GNOME Shell stutters when VRAM runs out, and compare with it off.
 
-A reserve as large as the VRAM turns the ceiling off, with a warning. Nothing outside `app.slice` is limited.
+A reserve as large as the VRAM stops the daemon from starting. Nothing outside `app.slice` is limited.
 
 The daemon checks the ceiling at every focus change, since `app.slice` is made anew when a user manager restarts. Up to Linux 7.2, the kernel keeps the old limit without an error if `app.slice` already uses more than the ceiling; the daemon notices and tries again at the next focus change. From 7.3 it applies at once. The daemon never evicts to make room: the write is non-blocking.
 
@@ -166,7 +166,7 @@ ls /usr/share/gnome-shell/extensions/vram-booster@local/
 sudo journalctl -u gnome-vram-booster -b --no-pager
 ```
 
-Common cause: `dmemcg-booster` is not running or `dmem` is not in `cgroup.controllers`.
+Common cause: `dmemcg-booster` is not running or `dmem` is not in `cgroup.controllers`. The journal names the reason; a `VRAM_BOOST_RATIO` that is not a number above 0 and at most 1, a `VRAM_PROTECT_SESSION` other than 0 or 1, a `VRAM_RESERVE_MIB` that is not a whole number below the VRAM size, or a `DRM_KEY` that `dmem.capacity` does not list, stops it too.
 
 **dmem.low files missing under app scopes**
 
