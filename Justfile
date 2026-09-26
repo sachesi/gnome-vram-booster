@@ -33,9 +33,9 @@ build:
 # Lints, unit tests and the extension's schema.
 check:
     cd daemon && cargo fmt --check
-    cd daemon && cargo clippy -- -D warnings
+    cd daemon && cargo clippy --all-targets -- -D warnings
     cd daemon && cargo test
-    glib-compile-schemas --strict extension/schemas
+    glib-compile-schemas --strict --dry-run extension/schemas
 
 # Binaries come from `just build` (or any other checkout/toolchain); install
 # never builds, so a host without a Rust toolchain can still install.
