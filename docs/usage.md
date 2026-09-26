@@ -75,16 +75,16 @@ Daemon:           running
 DRM key:          drm/0000:2d:00.0/vram
 VRAM total:       8573157376 (8176 MiB, 7.98 GiB)
 Boost ratio:      90%
-Boosted bytes:    7715841638 (7360 MiB, 7.19 GiB) (90% of total)
+Boosted bytes:    7715841638 (7358 MiB, 7.19 GiB) (90% of total)
 Session low:      8573157376 (8176 MiB, 7.98 GiB)
 App ceiling:      off
 Current unit:     app-org.example.Game.scope
-Boosted cgroup:   (none)
+Boosted cgroup:   /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.example.Game.scope
 ```
 
 ## Debug indicator
 
-Open the Extensions app, click the gear icon next to **GNOME VRAM Booster**, and enable **Show active app in panel**. A label appears in the top bar showing which app currently holds VRAM priority, or `VRAM: idle` when the focused window is not under `app.slice`.
+Open the Extensions app, click the gear icon next to **GNOME VRAM Booster**, and enable **Show active app in panel**. A label appears in the top bar showing which app currently holds VRAM priority, `idle` when the focused window is not under `app.slice`, or `offline` while the daemon is not running.
 
 ## Verifying
 
