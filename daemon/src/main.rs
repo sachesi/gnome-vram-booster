@@ -645,14 +645,6 @@ impl Inner {
         }
     }
 
-    /// The value the daemon keeps in `file` of a slice; 0 when it keeps none.
-    fn slice_value(&self, file: &str) -> u64 {
-        self.slices
-            .iter()
-            .find(|s| s.file == file)
-            .map_or(0, |s| s.value)
-    }
-
     async fn reset_previous(&mut self) {
         let targets = self.prev_cgroup.take().into_iter();
         for prev in targets.chain(self.unconfirmed.take()) {
@@ -759,8 +751,34 @@ impl Inner {
     }
 }
 
+/// What the changing properties report. Kept apart from `Inner`, so that
+/// reading them never waits behind a dmem write that holds its lock.
+#[derive(Default)]
+struct Status {
+    current_unit: String,
+    prev_cgroup: String,
+}
+
 struct VramBoosterService {
     inner: Arc<Mutex<Inner>>,
+    status: tokio::sync::watch::Sender<Status>,
+    drm_key: String,
+    vram_total: u64,
+    boost_ratio: f64,
+    boosted_bytes: u64,
+    /// dmem.max this daemon puts on each user's app.slice; 0 when off.
+    app_slice_ceiling: u64,
+    /// dmem.low the daemon puts on each user's session.slice; 0 when none.
+    session_slice_low: u64,
+}
+
+impl VramBoosterService {
+    fn publish(&self, inner: &Inner) {
+        self.status.send_replace(Status {
+            current_unit: inner.current_unit.clone(),
+            prev_cgroup: inner.prev_cgroup.clone().unwrap_or_default(),
+        });
+    }
 }
 
 #[interface(name = "org.gnome.VramBooster")]
@@ -794,7 +812,9 @@ impl VramBoosterService {
             ours
         });
         let mut inner = self.inner.lock().await;
-        Ok(inner.handle_focus(cgroup, pid, &caller).await)
+        let boosted = inner.handle_focus(cgroup, pid, &caller).await;
+        self.publish(&inner);
+        Ok(boosted)
     }
 
     /// Drop the boost, if it is the caller's.
@@ -806,54 +826,48 @@ impl VramBoosterService {
         let caller = caller_slice(conn, &header).await?;
         let mut inner = self.inner.lock().await;
         inner.clear_for(&caller).await;
+        self.publish(&inner);
         Ok(true)
     }
 
     #[zbus(property(emits_changed_signal = "false"))]
     async fn current_unit(&self) -> String {
-        self.inner.lock().await.current_unit.clone()
+        self.status.borrow().current_unit.clone()
     }
 
     #[zbus(property(emits_changed_signal = "const"))]
     async fn drm_key(&self) -> String {
-        self.inner.lock().await.drm_key.clone()
+        self.drm_key.clone()
     }
 
     #[zbus(property(emits_changed_signal = "const"))]
     async fn vram_total(&self) -> u64 {
-        self.inner.lock().await.vram_total
+        self.vram_total
     }
 
     #[zbus(property(emits_changed_signal = "const"))]
     async fn boost_ratio(&self) -> f64 {
-        self.inner.lock().await.boost_ratio
+        self.boost_ratio
     }
 
     #[zbus(property(emits_changed_signal = "const"))]
     async fn boosted_bytes(&self) -> u64 {
-        self.inner.lock().await.boost_bytes()
+        self.boosted_bytes
     }
 
-    /// dmem.max this daemon puts on each user's app.slice; 0 when off.
     #[zbus(property(emits_changed_signal = "const"))]
     async fn app_slice_ceiling(&self) -> u64 {
-        self.inner.lock().await.slice_value("dmem.max")
+        self.app_slice_ceiling
     }
 
-    /// dmem.low the daemon puts on each user's session.slice; 0 when none.
     #[zbus(property(emits_changed_signal = "const"))]
     async fn session_slice_low(&self) -> u64 {
-        self.inner.lock().await.slice_value("dmem.low")
+        self.session_slice_low
     }
 
     #[zbus(property(emits_changed_signal = "false"))]
     async fn prev_cgroup(&self) -> String {
-        self.inner
-            .lock()
-            .await
-            .prev_cgroup
-            .clone()
-            .unwrap_or_default()
+        self.status.borrow().prev_cgroup.clone()
     }
 }
 
@@ -950,6 +964,13 @@ async fn main() {
     }));
     let service = VramBoosterService {
         inner: inner.clone(),
+        status: tokio::sync::watch::Sender::new(Status::default()),
+        drm_key: drm_key.clone(),
+        vram_total,
+        boost_ratio,
+        boosted_bytes: boost_bytes,
+        app_slice_ceiling: ceiling.unwrap_or(0),
+        session_slice_low: if protect_session { vram_total } else { 0 },
     };
 
     let conn = connection::Builder::system()
@@ -1141,6 +1162,36 @@ mod tests {
         assert_eq!(ceiling_for(8192 * mib, 0), Ok(None));
         assert!(ceiling_for(256 * mib, 256).is_err());
         assert!(ceiling_for(8192 * mib, u64::MAX).is_err());
+    }
+
+    /// Properties read what the last call published, not the state itself,
+    /// so a Get answers while a dmem write holds the lock on the state.
+    #[tokio::test]
+    async fn properties_answer_while_the_state_is_locked() {
+        let key = "drm/0000:2d:00.0/vram";
+        let mut inner = inner_with(key, Vec::new(), Duration::from_secs(2));
+        let cgroup = "/a/app.slice/app-foo.scope".to_string();
+        inner.prev_cgroup = Some(cgroup.clone());
+        inner.current_unit = "app-foo.scope".to_string();
+        let service = VramBoosterService {
+            inner: Arc::new(Mutex::new(inner)),
+            status: tokio::sync::watch::Sender::new(Status::default()),
+            drm_key: key.to_string(),
+            vram_total: 1000,
+            boost_ratio: 0.9,
+            boosted_bytes: 900,
+            app_slice_ceiling: 0,
+            session_slice_low: 1000,
+        };
+        service.publish(&*service.inner.lock().await);
+
+        let _held = service.inner.lock().await;
+        let read = async { (service.current_unit().await, service.prev_cgroup().await) };
+        let (unit, boosted) = tokio::time::timeout(Duration::from_secs(1), read)
+            .await
+            .expect("a property read waited for the state lock");
+        assert_eq!(unit, "app-foo.scope");
+        assert_eq!(boosted, cgroup);
     }
 
     /// The slice files are ordinary files here: a setting goes where the file
