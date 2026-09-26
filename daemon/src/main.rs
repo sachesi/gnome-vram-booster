@@ -269,19 +269,30 @@ fn app_unit_cgroup(cgroup_dir: &str) -> Option<String> {
     None
 }
 
-/// The `user-<uid>.slice` of whoever sent a call. The daemon runs as root for
-/// every user, so a caller boosts, and takes back, only what sits in its own.
-async fn caller_slice(conn: &zbus::Connection, header: &Header<'_>) -> zbus::fdo::Result<PathBuf> {
-    let sender = header
-        .sender()
-        .ok_or_else(|| zbus::fdo::Error::AccessDenied("the call names no sender".into()))?;
-    let uid = zbus::fdo::DBusProxy::new(conn)
-        .await?
-        .get_connection_unix_user(sender.clone().into())
-        .await?;
-    Ok(PathBuf::from(format!(
-        "/sys/fs/cgroup/user.slice/user-{uid}.slice"
-    )))
+/// Who sent a call, and which of its connection's messages the call was.
+struct Caller {
+    /// The caller's `user-<uid>.slice`. The daemon runs as root for every
+    /// user, so a caller boosts, and takes back, only what sits in its own.
+    slice: PathBuf,
+    sender: String,
+    serial: u32,
+}
+
+impl Caller {
+    async fn of(conn: &zbus::Connection, header: &Header<'_>) -> zbus::fdo::Result<Self> {
+        let sender = header
+            .sender()
+            .ok_or_else(|| zbus::fdo::Error::AccessDenied("the call names no sender".into()))?;
+        let uid = zbus::fdo::DBusProxy::new(conn)
+            .await?
+            .get_connection_unix_user(sender.clone().into())
+            .await?;
+        Ok(Self {
+            slice: PathBuf::from(format!("/sys/fs/cgroup/user.slice/user-{uid}.slice")),
+            sender: sender.to_string(),
+            serial: header.primary().serial_num().get(),
+        })
+    }
 }
 
 /// Best-effort startup cleanup: clear dmem.low values left behind by a crashed
@@ -536,9 +547,31 @@ struct Inner {
     /// `slices`, with the setting's state there.
     slice_states: HashMap<(String, usize), SliceState>,
     writer: DmemWriter,
+    /// The last call applied for each user's slice: its connection and serial.
+    latest: HashMap<PathBuf, (String, u32)>,
 }
 
 impl Inner {
+    /// Whether a later call from the same connection was applied already.
+    /// zbus runs calls side by side, so a FocusChanged still resolving its pid
+    /// can reach this lock after the ClearFocus the shell sent behind it; the
+    /// older call must then change nothing. Serials order one connection's
+    /// messages only, and are compared modulo 2^32, so one that wrapped still
+    /// counts as later.
+    fn superseded(&mut self, caller: &Caller) -> bool {
+        if let Some((sender, serial)) = self.latest.get(&caller.slice)
+            && *sender == caller.sender
+        {
+            let behind = serial.wrapping_sub(caller.serial);
+            if behind != 0 && behind < 1 << 31 {
+                return true;
+            }
+        }
+        self.latest
+            .insert(caller.slice.clone(), (caller.sender.clone(), caller.serial));
+        false
+    }
+
     fn boost_bytes(&self) -> u64 {
         (self.vram_total as f64 * self.boost_ratio) as u64
     }
@@ -794,7 +827,7 @@ impl VramBoosterService {
         // cancel it. The deadline inside is what stops it; the outer timeout
         // only covers the handoff.
         const BUDGET: Duration = Duration::from_millis(500);
-        let caller = caller_slice(conn, &header).await?;
+        let caller = Caller::of(conn, &header).await?;
         let deadline = Instant::now() + BUDGET;
         let cgroup = tokio::time::timeout(
             BUDGET + Duration::from_millis(100),
@@ -805,14 +838,21 @@ impl VramBoosterService {
         .and_then(|r| r.ok())
         .flatten()
         .filter(|c| {
-            let ours = Path::new(c).starts_with(&caller);
+            let ours = Path::new(c).starts_with(&caller.slice);
             if !ours {
-                warn!("ignoring {}: outside {}", loggable(c), caller.display());
+                warn!(
+                    "ignoring {}: outside {}",
+                    loggable(c),
+                    caller.slice.display()
+                );
             }
             ours
         });
         let mut inner = self.inner.lock().await;
-        let boosted = inner.handle_focus(cgroup, pid, &caller).await;
+        if inner.superseded(&caller) {
+            return Ok(false);
+        }
+        let boosted = inner.handle_focus(cgroup, pid, &caller.slice).await;
         self.publish(&inner);
         Ok(boosted)
     }
@@ -823,10 +863,12 @@ impl VramBoosterService {
         #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(header)] header: Header<'_>,
     ) -> zbus::fdo::Result<bool> {
-        let caller = caller_slice(conn, &header).await?;
+        let caller = Caller::of(conn, &header).await?;
         let mut inner = self.inner.lock().await;
-        inner.clear_for(&caller).await;
-        self.publish(&inner);
+        if !inner.superseded(&caller) {
+            inner.clear_for(&caller.slice).await;
+            self.publish(&inner);
+        }
         Ok(true)
     }
 
@@ -961,6 +1003,7 @@ async fn main() {
         slices,
         slice_states: HashMap::new(),
         writer: DmemWriter::new(Duration::from_secs(2)),
+        latest: HashMap::new(),
     }));
     let service = VramBoosterService {
         inner: inner.clone(),
@@ -1079,6 +1122,7 @@ mod tests {
             slices,
             slice_states: HashMap::new(),
             writer: DmemWriter::new(write_timeout),
+            latest: HashMap::new(),
         }
     }
 
@@ -1192,6 +1236,28 @@ mod tests {
             .expect("a property read waited for the state lock");
         assert_eq!(unit, "app-foo.scope");
         assert_eq!(boosted, cgroup);
+    }
+
+    /// Calls from one connection count in the order it sent them, whichever
+    /// reaches the lock first; another connection or user starts afresh.
+    #[test]
+    fn an_older_call_from_the_same_connection_is_superseded() {
+        let mut inner = inner_with("drm/0000:2d:00.0/vram", Vec::new(), Duration::from_secs(2));
+        let call = |uid: u32, sender: &str, serial: u32| Caller {
+            slice: PathBuf::from(format!("/sys/fs/cgroup/user.slice/user-{uid}.slice")),
+            sender: sender.to_string(),
+            serial,
+        };
+
+        assert!(!inner.superseded(&call(1000, ":1.5", 11)));
+        assert!(inner.superseded(&call(1000, ":1.5", 10)));
+        assert!(!inner.superseded(&call(1000, ":1.5", 12)));
+        // a debugging busctl of the same user has serials of its own
+        assert!(!inner.superseded(&call(1000, ":1.9", 2)));
+        assert!(!inner.superseded(&call(1001, ":1.7", u32::MAX - 1)));
+        // past the wrap, a small serial is the later one
+        assert!(!inner.superseded(&call(1001, ":1.7", 3)));
+        assert!(inner.superseded(&call(1001, ":1.7", u32::MAX)));
     }
 
     /// The slice files are ordinary files here: a setting goes where the file
