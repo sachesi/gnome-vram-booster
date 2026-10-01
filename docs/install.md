@@ -22,9 +22,11 @@ https://pixelcluster.github.io/VRAM-Mgmt-fixed/
 Enable and start both the system service (propagates dmem into user session cgroups) and the user service (propagates dmem into app scopes):
 
 ```
-sudo systemctl enable --now dmemcg-booster.service
-systemctl --user enable --now dmemcg-booster.service
+sudo systemctl enable --now dmemcg-booster-system.service
+systemctl --user enable --now dmemcg-booster-user.service
 ```
+
+The AUR and COPR packages enable both on install. COPR builds before 0.1.3-2 installed both as `dmemcg-booster.service`, one a system unit and one a user unit.
 
 **3. Rust toolchain**, only where you build
 
@@ -39,7 +41,7 @@ just build
 just install
 ```
 
-`just build` runs `cargo build --release` and needs the Rust toolchain. `just install` never builds: it only checks that `daemon/target/release/` holds the binaries, so a machine without Rust, such as the host when you build in a container, can install binaries built elsewhere. Run it as your user, not with `sudo`: it calls `sudo` itself, and under `sudo` its check of the user `dmemcg-booster.service` would ask root's service manager instead of yours. `just install` will:
+`just build` runs `cargo build --release` and needs the Rust toolchain. `just install` never builds: it only checks that `daemon/target/release/` holds the binaries, so a machine without Rust, such as the host when you build in a container, can install binaries built elsewhere. Run it as your user, not with `sudo`: it calls `sudo` itself, and under `sudo` its check of `dmemcg-booster-user.service` would ask root's service manager instead of yours. `just install` will:
 
 - Install the binaries to `/usr/bin/gnome-vram-booster` and `/usr/bin/gnome-vram-boosterctl`
 - Install the systemd service to `/usr/lib/systemd/system/`

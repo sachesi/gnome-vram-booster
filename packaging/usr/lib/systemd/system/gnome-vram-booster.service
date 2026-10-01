@@ -1,7 +1,10 @@
 [Unit]
 Description=GNOME VRAM Booster - dynamic dmem cgroup prioritization for foreground apps
-After=dmemcg-booster.service
-Requires=dmemcg-booster.service
+# Upstream calls the system half dmemcg-booster-system.service; COPR builds
+# before 0.1.3-2 installed it as dmemcg-booster.service. Ordering on a unit
+# that does not exist is ignored, Requires= on one is a start failure, so a
+# missing controller is left for the daemon to report.
+After=dmemcg-booster-system.service dmemcg-booster.service
 
 [Service]
 Type=dbus

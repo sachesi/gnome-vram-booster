@@ -173,7 +173,8 @@ Common cause: `dmemcg-booster` is not running or `dmem` is not in `cgroup.contro
 `dmemcg-booster` has not propagated the controller. Check its status:
 
 ```
-systemctl status dmemcg-booster.service
+systemctl status dmemcg-booster-system.service
+systemctl --user status dmemcg-booster-user.service
 ```
 
 **Boost not happening for a specific app**
