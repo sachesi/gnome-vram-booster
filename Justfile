@@ -53,7 +53,7 @@ not-root:
 # Check the kernel and dmemcg-booster this machine runs.
 check-deps: not-root
     @grep -qw dmem /sys/fs/cgroup/cgroup.controllers || \
-        { echo "ERROR: 'dmem' controller missing from /sys/fs/cgroup/cgroup.controllers. Need kernel 6.14+ with dmem cgroup support, 6.15+ for amdgpu."; exit 1; }
+        { echo "ERROR: 'dmem' controller missing from /sys/fs/cgroup/cgroup.controllers. Need kernel 6.14+ with dmem cgroup support (amdgpu from 6.15, NVIDIA's open modules from driver 615)."; exit 1; }
     @systemctl is-active --quiet dmemcg-booster-system.service || systemctl is-active --quiet dmemcg-booster.service || \
         { echo "ERROR: the system dmemcg-booster service is not active. Run: sudo systemctl enable --now dmemcg-booster-system.service"; exit 1; }
     @systemctl --user is-active --quiet dmemcg-booster-user.service || systemctl --user is-active --quiet dmemcg-booster.service || \
