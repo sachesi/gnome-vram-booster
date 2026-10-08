@@ -66,7 +66,7 @@ fn read_dmem_capacity() -> Result<(String, u64), String> {
     let entries = parse_dmem_capacity(&content);
     if entries.is_empty() {
         return Err(
-            "no GPU memory regions in /sys/fs/cgroup/dmem.capacity. Is dmemcg-booster running, and does the GPU driver expose dmem (amdgpu 6.15+, Xe, NVIDIA's open modules)?"
+            "no GPU memory regions in /sys/fs/cgroup/dmem.capacity. Is dmemcg-booster running, and does the GPU driver expose dmem (amdgpu on kernel 6.15+, xe on 6.14+, NVIDIA's open modules from driver 615)?"
                 .to_string(),
         );
     }
