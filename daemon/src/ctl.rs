@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use zbus::Connection;
-use zvariant::OwnedValue;
+use zbus::zvariant::OwnedValue;
 
 /// Unit names and cgroup paths come from other processes, any user's, so
 /// they can carry control characters that would rewrite the terminal. Strip
