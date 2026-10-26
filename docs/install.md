@@ -43,7 +43,7 @@ just install
 
 `just build` runs `cargo build --release` and needs the Rust toolchain. `just install` never builds: it only checks that `daemon/target/release/` holds the binaries, so a machine without Rust, such as the host when you build in a container, can install binaries built elsewhere. Run it as your user, not with `sudo`: it calls `sudo` itself, and under `sudo` its check of `dmemcg-booster-user.service` would ask root's service manager instead of yours. `just install` will:
 
-- Install the binaries to `/usr/bin/gnome-vram-booster` and `/usr/bin/gnome-vram-boosterctl`
+- Install the daemon to `/usr/lib/gnome-vram-booster/gnome-vram-booster`, where only the service starts it, and `gnome-vram-boosterctl` to `/usr/bin/`
 - Install the systemd service to `/usr/lib/systemd/system/`
 - Install the D-Bus policy to `/usr/share/dbus-1/system.d/`
 - Copy the GNOME Shell extension to `/usr/share/gnome-shell/extensions/`
