@@ -13,8 +13,7 @@ binary      := "gnome-vram-booster"
 ctl         := "gnome-vram-boosterctl"
 bin_src     := "daemon/target/release/" + binary
 ctl_src     := "daemon/target/release/" + ctl
-bin_dir     := "/usr/lib/" + binary
-bin_dest    := bin_dir + "/" + binary
+bin_dest    := "/usr/libexec/" + binary
 # Where installs up to 0.7.4 put the daemon, removed so that it leaves PATH.
 old_bin     := "/usr/bin/" + binary
 ctl_dest    := "/usr/bin/" + ctl
@@ -83,7 +82,6 @@ install: check-deps check-bins
 uninstall:
     -sudo systemctl disable --now {{binary}}.service
     -sudo rm -f {{bin_dest}} {{old_bin}} {{ctl_dest}} {{service_dir}}/{{binary}}.service {{dbus_dir}}/org.gnome.VramBooster.conf
-    -sudo rmdir {{bin_dir}}
     -sudo systemctl daemon-reload
     -sudo rm -rf {{ext_dest}}
     @echo ""
