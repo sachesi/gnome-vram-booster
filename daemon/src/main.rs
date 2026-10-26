@@ -1042,6 +1042,14 @@ async fn main() {
             Err(zbus::Error::NameTaken) => {
                 die("org.gnome.VramBooster is already taken: another instance is running")
             }
+            Err(e)
+                if matches!(&e, zbus::Error::MethodError(name, ..)
+                    if name.as_str() == "org.freedesktop.DBus.Error.AccessDenied") =>
+            {
+                die(&format!(
+                    "cannot own org.gnome.VramBooster ({e}): the daemon runs as root from gnome-vram-booster.service; for its status, run gnome-vram-boosterctl"
+                ))
+            }
             Err(e) => die(&format!("cannot reach the system bus: {e}")),
         },
         Err(e) => die(&format!("cannot set up the system bus connection: {e}")),
