@@ -9,7 +9,7 @@ After=dmemcg-booster-system.service dmemcg-booster.service
 [Service]
 Type=dbus
 BusName=org.gnome.VramBooster
-ExecStart=/usr/bin/gnome-vram-booster
+ExecStart=/usr/lib/gnome-vram-booster/gnome-vram-booster
 Environment=RUST_LOG=warn
 # Overrides, best set with `systemctl edit`: the share of VRAM to boost
 # (above 0, up to 1), 0 to leave session.slice's dmem.low alone, and how far

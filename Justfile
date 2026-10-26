@@ -13,7 +13,10 @@ binary      := "gnome-vram-booster"
 ctl         := "gnome-vram-boosterctl"
 bin_src     := "daemon/target/release/" + binary
 ctl_src     := "daemon/target/release/" + ctl
-bin_dest    := "/usr/bin/" + binary
+bin_dir     := "/usr/lib/" + binary
+bin_dest    := bin_dir + "/" + binary
+# Where installs up to 0.7.4 put the daemon, removed so that it leaves PATH.
+old_bin     := "/usr/bin/" + binary
 ctl_dest    := "/usr/bin/" + ctl
 service     := "packaging/usr/lib/systemd/system/" + binary + ".service"
 service_dir := "/usr/lib/systemd/system"
@@ -63,6 +66,7 @@ check-deps: not-root
 # Install the release build, the system service and the extension. Does not build: run `just build` first.
 install: check-deps check-bins
     sudo install -Dm755 {{bin_src}} {{bin_dest}}
+    sudo rm -f {{old_bin}}
     sudo install -Dm755 {{ctl_src}} {{ctl_dest}}
     sudo install -Dm644 {{service}} {{service_dir}}/{{binary}}.service
     sudo install -Dm644 {{dbus_conf}} {{dbus_dir}}/org.gnome.VramBooster.conf
@@ -78,16 +82,20 @@ install: check-deps check-bins
 # Disable the service and remove what install put in place.
 uninstall:
     -sudo systemctl disable --now {{binary}}.service
-    -sudo rm -f {{bin_dest}} {{ctl_dest}} {{service_dir}}/{{binary}}.service {{dbus_dir}}/org.gnome.VramBooster.conf
+    -sudo rm -f {{bin_dest}} {{old_bin}} {{ctl_dest}} {{service_dir}}/{{binary}}.service {{dbus_dir}}/org.gnome.VramBooster.conf
+    -sudo rmdir {{bin_dir}}
     -sudo systemctl daemon-reload
     -sudo rm -rf {{ext_dest}}
     @echo ""
     @echo "Uninstalled. Log out and back in to deactivate the extension."
 
-# Reinstall the built binaries and the extension, and restart the daemon.
+# Reinstall the built binaries, the service and the extension, and restart the daemon.
 reload: check-bins
     sudo install -Dm755 {{bin_src}} {{bin_dest}}
+    sudo rm -f {{old_bin}}
     sudo install -Dm755 {{ctl_src}} {{ctl_dest}}
+    sudo install -Dm644 {{service}} {{service_dir}}/{{binary}}.service
+    sudo systemctl daemon-reload
     sudo cp -r {{ext_src}}/. {{ext_dest}}/
     sudo chmod -R a+rX {{ext_dest}}
     sudo glib-compile-schemas {{ext_dest}}/schemas/
